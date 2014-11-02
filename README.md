@@ -13,7 +13,7 @@ Requirements
 ------------
 
 - Linux (kernel 2.4.* or 2.6.*)
-- FUSE + SQLite development files
+- FUSE + SQLite3 development files
 - A graphics card with support for OpenCL 1.1+
 
 Instructions

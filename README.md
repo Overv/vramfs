@@ -1,7 +1,7 @@
-VRAMFS
+vramfs
 ======
 
-VRAMFS is a utility that uses the [FUSE library](http://fuse.sourceforge.net/)
+vramfs is a utility that uses the [FUSE library](http://fuse.sourceforge.net/)
 to implement a file system in VRAM. The idea is pretty much the same as a RAM
 disk, except that it uses the video RAM of a discrete graphics card to store
 files. It is not intented for serious use, but it does actually work fairly

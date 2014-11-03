@@ -6,16 +6,18 @@
 
 // Standard library
 #include <iostream>
+#include <sstream>
 #include <cstring>
+#include <cstdint>
 
 // Configuration
-const char* entries_table_sql =
+static const char* entries_table_sql =
     "CREATE TABLE entries(" \
         // Automatic alias of unique ROWID
         "id INTEGER PRIMARY KEY," \
-        "parent INTEGER," \
+        "parent INTEGER DEFAULT 1," \
         "name TEXT NOT NULL," \
-        "directory INTEGER," \
+        "dir INTEGER," \
         "size INTEGER DEFAULT 4096," \
         // Numeric version of CURRENT_TIMESTAMP
         "atime INTEGER DEFAULT (STRFTIME('%s'))," \
@@ -23,8 +25,10 @@ const char* entries_table_sql =
         "ctime INTEGER DEFAULT (STRFTIME('%s'))" \
     ")";
 
-const char* root_entry_sql =
-    "INSERT INTO entries (id, parent, name, directory) VALUES (1, 1, '', 1);";
+static const char* root_entry_sql =
+    "INSERT INTO entries (id, name, dir) VALUES (1, '', 1);";
+
+static const int ROOT_ENTRY = 1;
 
 //
 // Helpers
@@ -56,13 +60,54 @@ static void close_index(sqlite3* db) {
     sqlite3_close(db);
 }
 
+// Find entry by path
+static int64_t find_entry(sqlite3* db, const char* path) {
+    // Traverse file system by directories, starting from root directory
+    int64_t entry = ROOT_ENTRY;
+    bool dir = true;
+
+    std::stringstream stream(path);
+    std::string part;
+    sqlite3_stmt* stmt;
+
+    while (getline(stream, part, '/')) {
+        // Check if we're currently in a directory before looking up entry
+        if (!dir) {
+            return -ENOTDIR;
+        }
+
+        // Look up corresponding entry in the current directory
+        sqlite3_prepare_v2(db, "SELECT id, dir FROM entries WHERE parent = ? AND name = ? LIMIT 1", -1, &stmt, nullptr);
+        if (!stmt) return fatal_error("failed to query entry", -EAGAIN);
+
+        sqlite3_bind_int64(stmt, 1, entry);
+        sqlite3_bind_text(stmt, 2, part.c_str(), -1, SQLITE_TRANSIENT);
+
+        // Check if an entry was found
+        int r = sqlite3_step(stmt);
+        if (r != SQLITE_ROW) {
+            sqlite3_finalize(stmt);
+            return -ENOENT;
+        }
+
+        // Continue with new current directory
+        entry = sqlite3_column_int64(stmt, 0);
+        dir = sqlite3_column_int(stmt, 1);
+
+        sqlite3_finalize(stmt);
+    }
+
+    // Return final entry
+    return entry;
+}
+
 //
 // Initialisation
 //
 
 static void* vram_init(fuse_conn_info* conn) {
     // Create file system index
-    sqlite3_config(SQLITE_CONFIG_URI, 1);
+    sqlite3_config(SQLITE_CONFIG_URI, true);
     sqlite3* db = open_index();
     if (!db) return fatal_error("failed to create index db", nullptr);
 

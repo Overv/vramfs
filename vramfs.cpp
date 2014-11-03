@@ -62,42 +62,46 @@ static void close_index(sqlite3* db) {
 
 // Find entry by path
 static int64_t find_entry(sqlite3* db, const char* path) {
-    // Traverse file system by directories, starting from root directory
+    // Prepare entry lookup query
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db, "SELECT id, dir FROM entries WHERE parent = ? AND name = ? LIMIT 1", -1, &stmt, nullptr);
+    if (!stmt) return fatal_error("failed to query entry", -EAGAIN);
+
+    // Traverse file system by hierarchically, starting from root directory
     int64_t entry = ROOT_ENTRY;
     bool dir = true;
 
     std::stringstream stream(path);
     std::string part;
-    sqlite3_stmt* stmt;
 
     while (getline(stream, part, '/')) {
-        // Check if we're currently in a directory before looking up entry
+        // If current directory is actually a file, abort
         if (!dir) {
-            return -ENOTDIR;
+            entry = -ENOTDIR;
+            break;
         }
 
         // Look up corresponding entry in the current directory
-        sqlite3_prepare_v2(db, "SELECT id, dir FROM entries WHERE parent = ? AND name = ? LIMIT 1", -1, &stmt, nullptr);
-        if (!stmt) return fatal_error("failed to query entry", -EAGAIN);
-
         sqlite3_bind_int64(stmt, 1, entry);
         sqlite3_bind_text(stmt, 2, part.c_str(), -1, SQLITE_TRANSIENT);
-
-        // Check if an entry was found
         int r = sqlite3_step(stmt);
+
+        // If entry was not found, abort
         if (r != SQLITE_ROW) {
-            sqlite3_finalize(stmt);
-            return -ENOENT;
+            entry = -ENOENT;
+            break;
         }
 
-        // Continue with new current directory
+        // Continue with entry as new current directory (if not end of path)
         entry = sqlite3_column_int64(stmt, 0);
         dir = sqlite3_column_int(stmt, 1);
 
-        sqlite3_finalize(stmt);
+        sqlite3_reset(stmt);
     }
 
-    // Return final entry
+    sqlite3_finalize(stmt);
+
+    // Return final entry or error
     return entry;
 }
 

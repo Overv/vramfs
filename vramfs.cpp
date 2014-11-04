@@ -12,6 +12,7 @@
 
 // Internal dependencies
 #include "resources.hpp"
+#include "types.hpp"
 
 // Configuration
 static const char* entries_table_sql =
@@ -34,9 +35,9 @@ static const char* root_entry_sql =
 static const int ROOT_PARENT = 0;
 static const int ROOT_ENTRY = 1;
 
-//
-// Helpers
-//
+/*
+ * Helpers
+ */
 
 // Error function that can be combined with a return statement to return *ret*
 template<typename T>
@@ -67,7 +68,7 @@ static sqlite_handle index_open() {
 }
 
 // Find entry by path (starting with /)
-static int64_t index_find(const sqlite_handle& db, const char* path, bool dironly = false) {
+static int64_t index_find(const sqlite_handle& db, const char* path, entry_filter::entry_filter_t filter = entry_filter::all) {
     // Prepare entry lookup query
     sqlite_stmt_handle stmt = prepare_query(db, "SELECT id, dir FROM entries WHERE parent = ? AND name = ? LIMIT 1");
     if (!stmt) return fatal_error("failed to query entry", -EAGAIN);
@@ -104,18 +105,22 @@ static int64_t index_find(const sqlite_handle& db, const char* path, bool dironl
         sqlite3_reset(stmt.get());
     }
 
-    // If a non-directory entry was found, but a dir was required, return error
-    if (entry > 0 && dironly && !dir) {
-        entry = -ENOTDIR;
+    // If an undesired type of entry was found, return an error
+    if (entry > 0) {
+        if (filter == entry_filter::directory && !dir) {
+            entry = -ENOTDIR;
+        } else if (filter == entry_filter::file && dir) {
+            entry = -EISDIR;
+        }
     }
 
     // Return final entry or error
     return entry;
 }
 
-//
-// Initialisation
-//
+/*
+ * Initialisation
+ */
 
 static void* vram_init(fuse_conn_info* conn) {
     // Create file system index
@@ -133,9 +138,9 @@ static void* vram_init(fuse_conn_info* conn) {
     return db.release();
 }
 
-//
-// Entry attributes
-//
+/*
+ * Entry attributes
+ */
 
 static int vram_getattr(const char* path, struct stat* stbuf) {
     sqlite_handle db = index_open();
@@ -173,15 +178,15 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
     }
 }
 
-//
-// Directory listing
-//
+/*
+ * Directory listing
+ */
 
-static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info* fi) {
+static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, fuse_file_info*) {
     sqlite_handle db = index_open();
 
     // Look up directory
-    int64_t entry = index_find(db, path, true);
+    int64_t entry = index_find(db, path, entry_filter::directory);
 
     if (entry > 0) {
         // List directory contents
@@ -204,23 +209,57 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
     }
 }
 
-//
-// Clean up
-//
+/*
+ * Open file
+ */
+
+static int vram_open(const char* path, fuse_file_info* fi) {
+    sqlite_handle db = index_open();
+
+    // Look up file
+    int64_t entry = index_find(db, path, entry_filter::file);
+
+    if (entry > 0) {
+        // Right now, only allow files to be read
+        if ((fi->flags & 3) == O_RDONLY) {
+            return 0;
+        } else {
+            return -EACCES;
+        }
+    } else {
+        // Error while looking up entry
+        return entry;
+    }
+}
+
+/*
+ * Read file
+ */
+
+static int vram_read(const char* path, char* buf, size_t size, off_t off, struct fuse_file_info* fi) {
+    // Right now, files have no contents
+    return 0;
+}
+
+/*
+ * Clean up
+ */
 
 static void vram_destroy(void* userdata) {
     sqlite3_close(reinterpret_cast<sqlite3*>(userdata));
 }
 
-//
-// FUSE setup
-//
+/*
+ * FUSE setup
+ */
 
 static struct vram_operations : fuse_operations {
     vram_operations() {
         init = vram_init;
         getattr = vram_getattr;
         readdir = vram_readdir;
+        open = vram_open;
+        read = vram_read;
         destroy = vram_destroy;
     }
 } operations;

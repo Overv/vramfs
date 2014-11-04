@@ -1,5 +1,5 @@
-#ifndef RESOURCES_HPP
-#define RESOURCES_HPP
+#ifndef VRAM_RESOURCES_HPP
+#define VRAM_RESOURCES_HPP
 
 /*
  * Wrappers around SQLite types for memory management

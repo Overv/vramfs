@@ -10,6 +10,9 @@
 #include <cstring>
 #include <cstdint>
 
+// Internal dependencies
+#include "resources.hpp"
+
 // Configuration
 static const char* entries_table_sql =
     "CREATE TABLE entries(" \
@@ -43,8 +46,14 @@ static T fatal_error(const char* error, T ret) {
     return ret;
 }
 
+static sqlite_stmt_handle prepare_query(const sqlite_handle& db, const char* query) {
+    sqlite3_stmt* stmt;
+    sqlite3_prepare_v2(db.get(), query, -1, &stmt, nullptr);
+    return sqlite_stmt_handle(stmt);
+}
+
 // Used by each function to get a new connection to the index (thread safety)
-static sqlite3* index_open() {
+static sqlite_handle index_open() {
     // In-memory database that is shared between multiple threads
     sqlite3* db;
     int ret = sqlite3_open("file::memory:?cache=shared", &db);
@@ -53,19 +62,14 @@ static sqlite3* index_open() {
         sqlite3_close(db);
         return nullptr;
     } else {
-        return db;
+        return sqlite_handle(db);
     }
 }
 
-static void index_close(sqlite3* db) {
-    sqlite3_close(db);
-}
-
 // Find entry by path (starting with /)
-static int64_t index_find(sqlite3* db, const char* path, bool dironly = false) {
+static int64_t index_find(const sqlite_handle& db, const char* path, bool dironly = false) {
     // Prepare entry lookup query
-    sqlite3_stmt* stmt;
-    sqlite3_prepare_v2(db, "SELECT id, dir FROM entries WHERE parent = ? AND name = ? LIMIT 1", -1, &stmt, nullptr);
+    sqlite_stmt_handle stmt = prepare_query(db, "SELECT id, dir FROM entries WHERE parent = ? AND name = ? LIMIT 1");
     if (!stmt) return fatal_error("failed to query entry", -EAGAIN);
 
     // Traverse file system by hierarchically, starting from root directory
@@ -83,9 +87,9 @@ static int64_t index_find(sqlite3* db, const char* path, bool dironly = false) {
         }
 
         // Look up corresponding entry in the current directory
-        sqlite3_bind_int64(stmt, 1, entry);
-        sqlite3_bind_text(stmt, 2, part.c_str(), -1, SQLITE_TRANSIENT);
-        int r = sqlite3_step(stmt);
+        sqlite3_bind_int64(stmt.get(), 1, entry);
+        sqlite3_bind_text(stmt.get(), 2, part.c_str(), -1, SQLITE_TRANSIENT);
+        int r = sqlite3_step(stmt.get());
 
         // If entry was not found, abort
         if (r != SQLITE_ROW) {
@@ -94,13 +98,11 @@ static int64_t index_find(sqlite3* db, const char* path, bool dironly = false) {
         }
 
         // Continue with entry as new current directory (if not end of path)
-        entry = sqlite3_column_int64(stmt, 0);
-        dir = sqlite3_column_int(stmt, 1);
+        entry = sqlite3_column_int64(stmt.get(), 0);
+        dir = sqlite3_column_int(stmt.get(), 1);
 
-        sqlite3_reset(stmt);
+        sqlite3_reset(stmt.get());
     }
-
-    sqlite3_finalize(stmt);
 
     // If a non-directory entry was found, but a dir was required, return error
     if (entry > 0 && dironly && !dir) {
@@ -118,17 +120,17 @@ static int64_t index_find(sqlite3* db, const char* path, bool dironly = false) {
 static void* vram_init(fuse_conn_info* conn) {
     // Create file system index
     sqlite3_config(SQLITE_CONFIG_URI, true);
-    sqlite3* db = index_open();
+    sqlite_handle db = index_open();
     if (!db) return fatal_error("failed to create index db", nullptr);
 
-    int r = sqlite3_exec(db, entries_table_sql, nullptr, nullptr, nullptr);
+    int r = sqlite3_exec(db.get(), entries_table_sql, nullptr, nullptr, nullptr);
     if (r) return fatal_error("failed to create index table", nullptr);
 
     // Add root directory, which is its own parent
-    r = sqlite3_exec(db, root_entry_sql, nullptr, nullptr, nullptr);
+    r = sqlite3_exec(db.get(), root_entry_sql, nullptr, nullptr, nullptr);
     if (r) return fatal_error("failed to create root directory", nullptr);
 
-    return db;
+    return db.release();
 }
 
 //
@@ -136,16 +138,15 @@ static void* vram_init(fuse_conn_info* conn) {
 //
 
 static int vram_getattr(const char* path, struct stat* stbuf) {
-    sqlite3* db = index_open();
+    sqlite_handle db = index_open();
 
     int ret = 0;
     if (strcmp(path, "/") == 0) {
         // Look up root directory
-        sqlite3_stmt* stmt;
-        sqlite3_prepare_v2(db, "SELECT size, atime, mtime, ctime FROM entries WHERE id = 1", -1, &stmt, nullptr);
+        sqlite_stmt_handle stmt = prepare_query(db, "SELECT size, atime, mtime, ctime FROM entries WHERE id = 1");
         if (!stmt) return fatal_error("failed to query entry", -EAGAIN);
 
-        int r = sqlite3_step(stmt);
+        int r = sqlite3_step(stmt.get());
         if (r != SQLITE_ROW) return fatal_error("no root directory", -EAGAIN);
 
         // Return info
@@ -154,17 +155,13 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
         stbuf->st_nlink = 2;
         stbuf->st_uid = geteuid();
         stbuf->st_gid = getegid();
-        stbuf->st_size = sqlite3_column_int64(stmt, 0);
-        stbuf->st_atime = sqlite3_column_int64(stmt, 1);
-        stbuf->st_mtime = sqlite3_column_int64(stmt, 2);
-        stbuf->st_ctime = sqlite3_column_int64(stmt, 3);
-
-        sqlite3_finalize(stmt);
+        stbuf->st_size = sqlite3_column_int64(stmt.get(), 0);
+        stbuf->st_atime = sqlite3_column_int64(stmt.get(), 1);
+        stbuf->st_mtime = sqlite3_column_int64(stmt.get(), 2);
+        stbuf->st_ctime = sqlite3_column_int64(stmt.get(), 3);
     } else {
         ret = -ENOENT;
     }
-
-    index_close(db);
 
     return ret;
 }
@@ -174,36 +171,30 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
 //
 
 static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info* fi) {
-    sqlite3* db = index_open();
+    sqlite_handle db = index_open();
 
     // Look up directory
     int64_t entry = index_find(db, path, true);
 
-    int ret = 0;
-    if (entry < 0) {
-        // Entry lookup error
-        ret = entry;
-    } else {
+    if (entry > 0) {
         // List directory contents
-        sqlite3_stmt* stmt;
-        sqlite3_prepare_v2(db, "SELECT name FROM entries WHERE parent = ?", -1, &stmt, nullptr);
-        sqlite3_bind_int64(stmt, 1, entry);
+        sqlite_stmt_handle stmt = prepare_query(db, "SELECT name FROM entries WHERE parent = ?");
+        sqlite3_bind_int64(stmt.get(), 1, entry);
 
         // Required default entries
         filler(buf, ".", nullptr, 0);
         filler(buf, "..", nullptr, 0);
 
-        while (sqlite3_step(stmt) == SQLITE_ROW) {
-            const unsigned char* name = sqlite3_column_text(stmt, 0);
+        while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+            const unsigned char* name = sqlite3_column_text(stmt.get(), 0);
             filler(buf, reinterpret_cast<const char*>(name), nullptr, 0);
         }
 
-        sqlite3_finalize(stmt);
+        return 0;
+    } else {
+        // Error instead of entry
+        return entry;
     }
-
-    index_close(db);
-
-    return ret;
 }
 
 //
@@ -211,7 +202,7 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
 //
 
 static void vram_destroy(void* userdata) {
-    index_close(reinterpret_cast<sqlite3*>(userdata));
+    sqlite3_close(reinterpret_cast<sqlite3*>(userdata));
 }
 
 //

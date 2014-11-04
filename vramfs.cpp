@@ -134,36 +134,43 @@ static void* vram_init(fuse_conn_info* conn) {
 }
 
 //
-// File attributes
+// Entry attributes
 //
 
 static int vram_getattr(const char* path, struct stat* stbuf) {
     sqlite_handle db = index_open();
 
-    int ret = 0;
-    if (strcmp(path, "/") == 0) {
-        // Look up root directory
-        sqlite_stmt_handle stmt = prepare_query(db, "SELECT size, atime, mtime, ctime FROM entries WHERE id = 1");
-        if (!stmt) return fatal_error("failed to query entry", -EAGAIN);
+    // Look up entry
+    int64_t entry = index_find(db, path);
 
-        int r = sqlite3_step(stmt.get());
-        if (r != SQLITE_ROW) return fatal_error("no root directory", -EAGAIN);
+    if (entry > 0) {
+        // Load all info about the entry
+        sqlite_stmt_handle stmt = prepare_query(db, "SELECT dir, size, atime, mtime, ctime FROM entries WHERE id = ?");
+        sqlite3_bind_int64(stmt.get(), 1, entry);
+        sqlite3_step(stmt.get());
 
-        // Return info
         memset(stbuf, 0, sizeof(struct stat));
-        stbuf->st_mode = S_IFDIR | 0755;
-        stbuf->st_nlink = 2;
+
+        if (sqlite3_column_int(stmt.get(), 0)) {
+            stbuf->st_mode = S_IFDIR | 0755;
+            stbuf->st_nlink = 2;
+        } else {
+            stbuf->st_mode = S_IFREG | 0444;
+            stbuf->st_nlink = 1;
+        }
+
         stbuf->st_uid = geteuid();
         stbuf->st_gid = getegid();
-        stbuf->st_size = sqlite3_column_int64(stmt.get(), 0);
-        stbuf->st_atime = sqlite3_column_int64(stmt.get(), 1);
-        stbuf->st_mtime = sqlite3_column_int64(stmt.get(), 2);
-        stbuf->st_ctime = sqlite3_column_int64(stmt.get(), 3);
-    } else {
-        ret = -ENOENT;
-    }
+        stbuf->st_size = sqlite3_column_int64(stmt.get(), 1);
+        stbuf->st_atime = sqlite3_column_int64(stmt.get(), 2);
+        stbuf->st_mtime = sqlite3_column_int64(stmt.get(), 3);
+        stbuf->st_ctime = sqlite3_column_int64(stmt.get(), 4);
 
-    return ret;
+        return 0;
+    } else {
+        // Error instead of entry
+        return entry;
+    }
 }
 
 //

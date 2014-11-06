@@ -21,7 +21,7 @@ static const char* entries_table_sql =
         "id INTEGER PRIMARY KEY," \
         "parent INTEGER DEFAULT 0," \
         "name TEXT NOT NULL," \
-        "dir INTEGER," \
+        "dir INTEGER DEFAULT 0," \
         "size INTEGER DEFAULT 4096," \
         // Numeric version of CURRENT_TIMESTAMP
         "atime INTEGER DEFAULT (STRFTIME('%s'))," \
@@ -48,7 +48,7 @@ static T fatal_error(const char* error, T ret) {
 }
 
 static sqlite_stmt_handle prepare_query(const sqlite_handle& db, const char* query) {
-    sqlite3_stmt* stmt;
+    sqlite3_stmt* stmt = nullptr;
     sqlite3_prepare_v2(db.get(), query, -1, &stmt, nullptr);
     return sqlite_stmt_handle(stmt);
 }
@@ -64,6 +64,19 @@ static sqlite_handle index_open() {
         return nullptr;
     } else {
         return sqlite_handle(db);
+    }
+}
+
+// Split path/to/file.txt into "path/to" and "file.txt"
+static void split_file_path(const std::string& path, std::string& dir, std::string& file) {
+    size_t p = path.rfind("/");
+
+    if (p == std::string::npos) {
+        dir = "";
+        file = path;
+    } else {
+        dir = path.substr(0, p);
+        file = path.substr(p + 1);
     }
 }
 
@@ -105,6 +118,9 @@ static int64_t index_find(const sqlite_handle& db, const char* path, entry_filte
         sqlite3_reset(stmt.get());
     }
 
+    // If the path is empty, assume the root directory
+    if (!path[0]) entry = ROOT_ENTRY;
+
     // If an undesired type of entry was found, return an error
     if (entry > 0) {
         if (filter == entry_filter::directory && !dir) {
@@ -125,6 +141,8 @@ static int64_t index_find(const sqlite_handle& db, const char* path, entry_filte
 static void* vram_init(fuse_conn_info* conn) {
     // Create file system index
     sqlite3_config(SQLITE_CONFIG_URI, true);
+    sqlite3_config(SQLITE_CONFIG_MULTITHREAD, true);
+
     sqlite_handle db = index_open();
     if (!db) return fatal_error("failed to create index db", nullptr);
 
@@ -157,10 +175,10 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
         memset(stbuf, 0, sizeof(struct stat));
 
         if (sqlite3_column_int(stmt.get(), 0)) {
-            stbuf->st_mode = S_IFDIR | 0755;
+            stbuf->st_mode = S_IFDIR | 0700;
             stbuf->st_nlink = 2;
         } else {
-            stbuf->st_mode = S_IFREG | 0444;
+            stbuf->st_mode = S_IFREG | 0600;
             stbuf->st_nlink = 1;
         }
 
@@ -210,6 +228,47 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
 }
 
 /*
+ * Create file
+ */
+
+static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
+    sqlite_handle db = index_open();
+
+    // Fail if file already exists
+    int64_t entry = index_find(db, path);
+    if (entry > 0) return -EEXIST;
+
+    // Split path in directory and file name parts
+    std::string dir, file;
+    split_file_path(path, dir, file);
+
+    // Check if directory exists
+    entry = index_find(db, dir.c_str(), entry_filter::directory);
+    if (entry < 0) return entry;
+
+    // Create new file
+    sqlite_stmt_handle stmt = prepare_query(db, "INSERT INTO entries (parent, name, size) VALUES (?, ?, 0)");
+    sqlite3_bind_int64(stmt.get(), 1, entry);
+    sqlite3_bind_text(stmt.get(), 2, file.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
+
+    // Open it by assigning new file handle
+    // Last rowid is stored on a per connection basis, so no race condition here
+    fi->fh = sqlite3_last_insert_rowid(db.get());
+
+    return 0;
+}
+
+/*
+ * Delete file
+ */
+
+static int vram_unlink(const char* path) {
+    // TODO: Implement
+    return 0;
+}
+
+/*
  * Open file
  */
 
@@ -220,14 +279,10 @@ static int vram_open(const char* path, fuse_file_info* fi) {
     int64_t entry = index_find(db, path, entry_filter::file);
 
     if (entry > 0) {
-        // Right now, only allow files to be read
-        if ((fi->flags & 3) == O_RDONLY) {
-            return 0;
-        } else {
-            return -EACCES;
-        }
+        fi->fh = entry;
+        return 0;
     } else {
-        // Error while looking up entry
+        // Return entry find error if it wasn't found
         return entry;
     }
 }
@@ -242,10 +297,20 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, struct
 }
 
 /*
+ * Write file
+ */
+
+static int vram_write(const char* path, const char* buf, size_t size, off_t off, struct fuse_file_info* fi) {
+    // Right now, files have no contents
+    return size;
+}
+
+/*
  * Clean up
  */
 
 static void vram_destroy(void* userdata) {
+    // Delete final reference to SQLite database
     sqlite3_close(reinterpret_cast<sqlite3*>(userdata));
 }
 
@@ -258,8 +323,11 @@ static struct vram_operations : fuse_operations {
         init = vram_init;
         getattr = vram_getattr;
         readdir = vram_readdir;
+        create = vram_create;
+        unlink = vram_unlink;
         open = vram_open;
         read = vram_read;
+        write = vram_write;
         destroy = vram_destroy;
     }
 } operations;

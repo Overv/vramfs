@@ -3,10 +3,6 @@
 
 /*
  * Wrappers around SQLite types for memory management
- *
- * The type is unique_ptr because these resources are not intented to be shared
- * beyond the scope of the function that allocates them. That's because SQLite
- * resources are not thread safe.
  */
 
 #include <memory>

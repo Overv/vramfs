@@ -9,6 +9,7 @@
 #include <sstream>
 #include <cstring>
 #include <cstdint>
+#include <mutex>
 
 // Internal dependencies
 #include "resources.hpp"
@@ -36,6 +37,16 @@ static const int ROOT_PARENT = 0;
 static const int ROOT_ENTRY = 1;
 
 /*
+ * Globals
+ */
+
+// Connection to file system database shared by threads (using serialized mode)
+sqlite3* db;
+
+// Lock for creating new entries (to avoid last insert rowid race conditions)
+std::mutex entry_create_lock;
+
+/*
  * Helpers
  */
 
@@ -47,24 +58,10 @@ static T fatal_error(const char* error, T ret) {
     return ret;
 }
 
-static sqlite_stmt_handle prepare_query(const sqlite_handle& db, const char* query) {
+static sqlite_stmt_handle prepare_query(sqlite3* db, const char* query) {
     sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(db.get(), query, -1, &stmt, nullptr);
+    sqlite3_prepare_v2(db, query, -1, &stmt, nullptr);
     return sqlite_stmt_handle(stmt);
-}
-
-// Used by each function to get a new connection to the index (thread safety)
-static sqlite_handle index_open() {
-    // In-memory database that is shared between multiple threads
-    sqlite3* db;
-    int ret = sqlite3_open("file::memory:?cache=shared", &db);
-
-    if (ret) {
-        sqlite3_close(db);
-        return nullptr;
-    } else {
-        return sqlite_handle(db);
-    }
 }
 
 // Split path/to/file.txt into "path/to" and "file.txt"
@@ -81,7 +78,7 @@ static void split_file_path(const std::string& path, std::string& dir, std::stri
 }
 
 // Find entry by path (starting with /)
-static int64_t index_find(const sqlite_handle& db, const char* path, entry_filter::entry_filter_t filter = entry_filter::all) {
+static int64_t index_find(sqlite3* db, const char* path, entry_filter::entry_filter_t filter = entry_filter::all) {
     // Prepare entry lookup query
     sqlite_stmt_handle stmt = prepare_query(db, "SELECT id, dir FROM entries WHERE parent = ? AND name = ? LIMIT 1");
     if (!stmt) return fatal_error("failed to query entry", -EAGAIN);
@@ -139,24 +136,24 @@ static int64_t index_find(const sqlite_handle& db, const char* path, entry_filte
  */
 
 static void* vram_init(fuse_conn_info* conn) {
-    // Create file system index
-    sqlite3_config(SQLITE_CONFIG_URI, true);
-    sqlite3_config(SQLITE_CONFIG_MULTITHREAD, true);
+    // Create in-memory file system index in standard serialized mode
+    int r = sqlite3_open(":memory:", &db);
+    if (r) {
+        sqlite3_close(db);
+        return fatal_error("failed to create index db", nullptr);
+    }
 
-    sqlite_handle db = index_open();
-    if (!db) return fatal_error("failed to create index db", nullptr);
-
-    int r = sqlite3_exec(db.get(), entries_table_sql, nullptr, nullptr, nullptr);
+    r = sqlite3_exec(db, entries_table_sql, nullptr, nullptr, nullptr);
     if (r) return fatal_error("failed to create index table", nullptr);
 
-    r = sqlite3_exec(db.get(), "CREATE INDEX idx_name ON entries (parent, name)", nullptr, nullptr, nullptr);
+    r = sqlite3_exec(db, "CREATE INDEX idx_name ON entries (parent, name)", nullptr, nullptr, nullptr);
     if (r) return fatal_error("failed to create db index", nullptr);
 
     // Add root directory, which is its own parent
-    r = sqlite3_exec(db.get(), root_entry_sql, nullptr, nullptr, nullptr);
+    r = sqlite3_exec(db, root_entry_sql, nullptr, nullptr, nullptr);
     if (r) return fatal_error("failed to create root directory", nullptr);
 
-    return db.release();
+    return db;
 }
 
 /*
@@ -164,8 +161,6 @@ static void* vram_init(fuse_conn_info* conn) {
  */
 
 static int vram_getattr(const char* path, struct stat* stbuf) {
-    sqlite_handle db = index_open();
-
     // Look up entry
     int64_t entry = index_find(db, path);
 
@@ -204,8 +199,6 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
  */
 
 static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, fuse_file_info*) {
-    sqlite_handle db = index_open();
-
     // Look up directory
     int64_t entry = index_find(db, path, entry_filter::directory);
 
@@ -235,8 +228,6 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
  */
 
 static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
-    sqlite_handle db = index_open();
-
     // Fail if file already exists
     int64_t entry = index_find(db, path);
     if (entry > 0) return -EEXIST;
@@ -250,14 +241,17 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     if (entry < 0) return entry;
 
     // Create new file
-    sqlite_stmt_handle stmt = prepare_query(db, "INSERT INTO entries (parent, name, size) VALUES (?, ?, 0)");
-    sqlite3_bind_int64(stmt.get(), 1, entry);
-    sqlite3_bind_text(stmt.get(), 2, file.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt.get());
+    entry_create_lock.lock();
 
-    // Open it by assigning new file handle
-    // Last rowid is stored on a per connection basis, so no race condition here
-    fi->fh = sqlite3_last_insert_rowid(db.get());
+        sqlite_stmt_handle stmt = prepare_query(db, "INSERT INTO entries (parent, name, size) VALUES (?, ?, 0)");
+        sqlite3_bind_int64(stmt.get(), 1, entry);
+        sqlite3_bind_text(stmt.get(), 2, file.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(stmt.get());
+
+        // Open it by assigning new file handle
+        fi->fh = sqlite3_last_insert_rowid(db);
+
+    entry_create_lock.unlock();
 
     return 0;
 }
@@ -276,8 +270,6 @@ static int vram_unlink(const char* path) {
  */
 
 static int vram_open(const char* path, fuse_file_info* fi) {
-    sqlite_handle db = index_open();
-
     // Look up file
     int64_t entry = index_find(db, path, entry_filter::file);
 
@@ -313,7 +305,7 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
  */
 
 static void vram_destroy(void* userdata) {
-    // Delete final reference to SQLite database
+    // Clean up index database
     sqlite3_close(reinterpret_cast<sqlite3*>(userdata));
 }
 

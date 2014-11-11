@@ -149,6 +149,9 @@ static void* vram_init(fuse_conn_info* conn) {
     int r = sqlite3_exec(db.get(), entries_table_sql, nullptr, nullptr, nullptr);
     if (r) return fatal_error("failed to create index table", nullptr);
 
+    r = sqlite3_exec(db.get(), "CREATE INDEX idx_name ON entries (parent, name)", nullptr, nullptr, nullptr);
+    if (r) return fatal_error("failed to create db index", nullptr);
+
     // Add root directory, which is its own parent
     r = sqlite3_exec(db.get(), root_entry_sql, nullptr, nullptr, nullptr);
     if (r) return fatal_error("failed to create root directory", nullptr);

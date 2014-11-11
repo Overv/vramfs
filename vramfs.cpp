@@ -291,7 +291,41 @@ static int vram_mkdir(const char* path, mode_t) {
  */
 
 static int vram_unlink(const char* path) {
-    // TODO: Implement
+    // Fail if entry doesn't exist or is a directory
+    int64_t entry = index_find(db, path, entry_filter::file);
+    if (entry < 0) return entry;
+
+    // Remove file
+    sqlite_stmt_handle stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
+    sqlite3_bind_int64(stmt.get(), 1, entry);
+    sqlite3_step(stmt.get());
+
+    return 0;
+}
+
+/*
+ * Delete directory
+ */
+
+static int vram_rmdir(const char* path) {
+    // Fail if entry doesn't exist or is a file
+    int64_t entry = index_find(db, path, entry_filter::directory);
+    if (entry < 0) return entry;
+
+    // Check if directory is empty
+    sqlite_stmt_handle stmt = prepare_query(db, "SELECT COUNT(*) FROM entries WHERE parent = ?");
+    sqlite3_bind_int64(stmt.get(), 1, entry);
+    sqlite3_step(stmt.get());
+
+    if (sqlite3_column_int64(stmt.get(), 0) != 0) {
+        return -ENOTEMPTY;
+    }
+
+    // Remove directory
+    stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
+    sqlite3_bind_int64(stmt.get(), 1, entry);
+    sqlite3_step(stmt.get());
+
     return 0;
 }
 
@@ -351,6 +385,7 @@ static struct vram_operations : fuse_operations {
         create = vram_create;
         mkdir = vram_mkdir;
         unlink = vram_unlink;
+        rmdir = vram_rmdir;
         open = vram_open;
         read = vram_read;
         write = vram_write;

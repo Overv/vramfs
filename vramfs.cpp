@@ -163,35 +163,50 @@ static void* vram_init(fuse_conn_info* conn) {
 static int vram_getattr(const char* path, struct stat* stbuf) {
     // Look up entry
     int64_t entry = index_find(db, path);
+    if (entry < 0) return entry;
 
-    if (entry > 0) {
-        // Load all info about the entry
-        sqlite_stmt_handle stmt = prepare_query(db, "SELECT dir, size, atime, mtime, ctime FROM entries WHERE id = ?");
-        sqlite3_bind_int64(stmt.get(), 1, entry);
-        sqlite3_step(stmt.get());
+    // Load all info about the entry
+    sqlite_stmt_handle stmt = prepare_query(db, "SELECT dir, size, atime, mtime, ctime FROM entries WHERE id = ?");
+    sqlite3_bind_int64(stmt.get(), 1, entry);
+    sqlite3_step(stmt.get());
 
-        memset(stbuf, 0, sizeof(struct stat));
+    memset(stbuf, 0, sizeof(struct stat));
 
-        if (sqlite3_column_int(stmt.get(), 0)) {
-            stbuf->st_mode = S_IFDIR | 0700;
-            stbuf->st_nlink = 2;
-        } else {
-            stbuf->st_mode = S_IFREG | 0600;
-            stbuf->st_nlink = 1;
-        }
-
-        stbuf->st_uid = geteuid();
-        stbuf->st_gid = getegid();
-        stbuf->st_size = sqlite3_column_int64(stmt.get(), 1);
-        stbuf->st_atime = sqlite3_column_int64(stmt.get(), 2);
-        stbuf->st_mtime = sqlite3_column_int64(stmt.get(), 3);
-        stbuf->st_ctime = sqlite3_column_int64(stmt.get(), 4);
-
-        return 0;
+    if (sqlite3_column_int(stmt.get(), 0)) {
+        stbuf->st_mode = S_IFDIR | 0700;
+        stbuf->st_nlink = 2;
     } else {
-        // Error instead of entry
-        return entry;
+        stbuf->st_mode = S_IFREG | 0600;
+        stbuf->st_nlink = 1;
     }
+
+    stbuf->st_uid = geteuid();
+    stbuf->st_gid = getegid();
+    stbuf->st_size = sqlite3_column_int64(stmt.get(), 1);
+    stbuf->st_atime = sqlite3_column_int64(stmt.get(), 2);
+    stbuf->st_mtime = sqlite3_column_int64(stmt.get(), 3);
+    stbuf->st_ctime = sqlite3_column_int64(stmt.get(), 4);
+
+    return 0;
+}
+
+/*
+ * Set the last access and last modified times of an entry
+ */
+
+static int vram_utimens(const char* path, const timespec tv[2]) {
+    // Look up entry
+    int64_t entry = index_find(db, path);
+    if (entry < 0) return entry;
+
+    // Update times (ignore nanosecond part)
+    sqlite_stmt_handle stmt = prepare_query(db, "UPDATE entries SET atime = ?, mtime = ?, ctime = STRFTIME('%s') WHERE id = ?");
+    sqlite3_bind_int64(stmt.get(), 1, tv[0].tv_sec);
+    sqlite3_bind_int64(stmt.get(), 2, tv[1].tv_sec);
+    sqlite3_bind_int64(stmt.get(), 3, entry);
+    sqlite3_step(stmt.get());
+
+    return 0;
 }
 
 /*
@@ -381,6 +396,7 @@ static struct vram_operations : fuse_operations {
     vram_operations() {
         init = vram_init;
         getattr = vram_getattr;
+        utimens = vram_utimens;
         readdir = vram_readdir;
         create = vram_create;
         mkdir = vram_mkdir;

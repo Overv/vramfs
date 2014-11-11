@@ -257,6 +257,36 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
 }
 
 /*
+ * Create directory
+ */
+
+static int vram_mkdir(const char* path, mode_t) {
+    // Fail if directory already exists
+    int64_t entry = index_find(db, path);
+    if (entry > 0) return -EEXIST;
+
+    // Split path in parent directory and new directory name parts
+    std::string parent, dir;
+    split_file_path(path, parent, dir);
+
+    // Check if parent directory exists
+    entry = index_find(db, parent.c_str(), entry_filter::directory);
+    if (entry < 0) return entry;
+
+    // Create new directory
+    entry_create_lock.lock();
+
+        sqlite_stmt_handle stmt = prepare_query(db, "INSERT INTO entries (parent, name, dir, size) VALUES (?, ?, 1, 0)");
+        sqlite3_bind_int64(stmt.get(), 1, entry);
+        sqlite3_bind_text(stmt.get(), 2, dir.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_step(stmt.get());
+
+    entry_create_lock.unlock();
+
+    return 0;
+}
+
+/*
  * Delete file
  */
 
@@ -319,6 +349,7 @@ static struct vram_operations : fuse_operations {
         getattr = vram_getattr;
         readdir = vram_readdir;
         create = vram_create;
+        mkdir = vram_mkdir;
         unlink = vram_unlink;
         open = vram_open;
         read = vram_read;

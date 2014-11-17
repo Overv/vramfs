@@ -84,10 +84,31 @@ static void split_file_path(const std::string& path, std::string& dir, std::stri
     }
 }
 
+// Retrieve current file buffer and entry (both may be nullptr)
+static void get_buffer(sqlite3* db, int64_t entry, cl::Buffer** buffer, size_t* size) {
+    auto stmt = prepare_query(db, "SELECT buffer, size FROM entries WHERE id = ?");
+    sqlite3_bind_int64(stmt.get(), 1, entry);
+    sqlite3_step(stmt.get());
+
+    if (buffer)
+        *buffer = reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt.get(), 0));
+    if (size)
+        *size = sqlite3_column_int64(stmt.get(), 1);
+}
+
+// Set file buffer and size of entry
+static void set_buffer(sqlite3* db, int64_t entry, cl::Buffer* buffer, size_t size) {
+    auto stmt = prepare_query(db, "UPDATE entries SET buffer = ?, size = ? WHERE id = ?");
+    sqlite3_bind_int64(stmt.get(), 1, reinterpret_cast<int64_t>(buffer));
+    sqlite3_bind_int64(stmt.get(), 2, size);
+    sqlite3_bind_int64(stmt.get(), 3, entry);
+    sqlite3_step(stmt.get());
+}
+
 // Find entry by path (starting with /)
 static int64_t index_find(sqlite3* db, const char* path, entry_filter::entry_filter_t filter = entry_filter::all) {
     // Prepare entry lookup query
-    sqlite_stmt_handle stmt = prepare_query(db, "SELECT id, dir FROM entries WHERE parent = ? AND name = ? LIMIT 1");
+    auto stmt = prepare_query(db, "SELECT id, dir FROM entries WHERE parent = ? AND name = ? LIMIT 1");
     if (!stmt) return fatal_error("failed to query entry", -EAGAIN);
 
     // Traverse file system by hierarchically, starting from root directory
@@ -185,7 +206,7 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
     if (entry < 0) return entry;
 
     // Load all info about the entry
-    sqlite_stmt_handle stmt = prepare_query(db, "SELECT dir, size, atime, mtime, ctime FROM entries WHERE id = ?");
+    auto stmt = prepare_query(db, "SELECT dir, size, atime, mtime, ctime FROM entries WHERE id = ?");
     sqlite3_bind_int64(stmt.get(), 1, entry);
     sqlite3_step(stmt.get());
 
@@ -219,7 +240,7 @@ static int vram_utimens(const char* path, const timespec tv[2]) {
     if (entry < 0) return entry;
 
     // Update times (ignore nanosecond part)
-    sqlite_stmt_handle stmt = prepare_query(db, "UPDATE entries SET atime = ?, mtime = ?, ctime = STRFTIME('%s') WHERE id = ?");
+    auto stmt = prepare_query(db, "UPDATE entries SET atime = ?, mtime = ?, ctime = STRFTIME('%s') WHERE id = ?");
     sqlite3_bind_int64(stmt.get(), 1, tv[0].tv_sec);
     sqlite3_bind_int64(stmt.get(), 2, tv[1].tv_sec);
     sqlite3_bind_int64(stmt.get(), 3, entry);
@@ -277,7 +298,7 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     // Create new file
     entry_create_lock.lock();
 
-        sqlite_stmt_handle stmt = prepare_query(db, "INSERT INTO entries (parent, name, size) VALUES (?, ?, 0)");
+        auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, size) VALUES (?, ?, 0)");
         sqlite3_bind_int64(stmt.get(), 1, entry);
         sqlite3_bind_text(stmt.get(), 2, file.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(stmt.get());
@@ -310,7 +331,7 @@ static int vram_mkdir(const char* path, mode_t) {
     // Create new directory
     entry_create_lock.lock();
 
-        sqlite_stmt_handle stmt = prepare_query(db, "INSERT INTO entries (parent, name, dir, size) VALUES (?, ?, 1, 0)");
+        auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, dir, size) VALUES (?, ?, 1, 0)");
         sqlite3_bind_int64(stmt.get(), 1, entry);
         sqlite3_bind_text(stmt.get(), 2, dir.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_step(stmt.get());
@@ -330,14 +351,12 @@ static int vram_unlink(const char* path) {
     if (entry < 0) return entry;
 
     // Delete OpenCL buffer
-    sqlite_stmt_handle stmt = prepare_query(db, "SELECT buffer FROM entries WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, entry);
-    sqlite3_step(stmt.get());
-
-    delete reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt.get(), 0));
+    cl::Buffer* ocl_buf;
+    get_buffer(db, entry, &ocl_buf, nullptr);
+    delete ocl_buf;
 
     // Remove file
-    stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
+    auto stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
     sqlite3_bind_int64(stmt.get(), 1, entry);
     sqlite3_step(stmt.get());
 
@@ -354,7 +373,7 @@ static int vram_rmdir(const char* path) {
     if (entry < 0) return entry;
 
     // Check if directory is empty
-    sqlite_stmt_handle stmt = prepare_query(db, "SELECT COUNT(*) FROM entries WHERE parent = ?");
+    auto stmt = prepare_query(db, "SELECT COUNT(*) FROM entries WHERE parent = ?");
     sqlite3_bind_int64(stmt.get(), 1, entry);
     sqlite3_step(stmt.get());
 
@@ -393,18 +412,13 @@ static int vram_open(const char* path, fuse_file_info* fi) {
 
 static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_file_info* fi) {
     // Get associated OpenCL buffer and file size
-    sqlite_stmt_handle stmt = prepare_query(db, "SELECT buffer, size FROM entries WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, fi->fh);
-    sqlite3_step(stmt.get());
-
-    cl::Buffer* ocl_buf = reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt.get(), 0));
+    cl::Buffer* ocl_buf;
+    size_t entry_size;
+    get_buffer(db, fi->fh, &ocl_buf, &entry_size);
     if (ocl_buf == nullptr) return 0;
 
-    // Cut off read at end of file
-    size_t entry_size = sqlite3_column_int64(stmt.get(), 1);
+    // Read data (limit read size to not exceed EOF)
     size_t read_size = std::min(off + size, entry_size);
-
-    // Read data
     int r = ocl_queue->enqueueReadBuffer(*ocl_buf, true, off, read_size, buf, nullptr, nullptr);
     if (r != CL_SUCCESS) return 0;
 
@@ -416,13 +430,10 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
  */
 
 static int vram_write(const char* path, const char* buf, size_t size, off_t off, fuse_file_info* fi) {
-    // Discard old buffer
-    sqlite_stmt_handle stmt = prepare_query(db, "SELECT buffer FROM entries WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, fi->fh);
-    sqlite3_step(stmt.get());
-
-    cl::Buffer* old_ocl_buf = reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt.get(), 0));
-    if (old_ocl_buf) delete old_ocl_buf;
+    // Discard any old buffer
+    cl::Buffer* old_ocl_buf;
+    get_buffer(db, fi->fh, &old_ocl_buf, nullptr);
+    delete old_ocl_buf;
 
     // Create OpenCL buffer for contents
     int r;
@@ -434,11 +445,7 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
     if (r != CL_SUCCESS) return fatal_error("failed to write to opencl buffer", -EIO);
 
     // Store reference to buffer in database and update size
-    stmt = prepare_query(db, "UPDATE entries SET buffer = ?, size = ? WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, reinterpret_cast<int64_t>(ocl_buf));
-    sqlite3_bind_int64(stmt.get(), 2, size);
-    sqlite3_bind_int64(stmt.get(), 3, fi->fh);
-    sqlite3_step(stmt.get());
+    set_buffer(db, fi->fh, ocl_buf, size);
 
     return size;
 }
@@ -453,12 +460,9 @@ static int vram_truncate(const char* path, off_t size) {
     if (entry < 0) return entry;
 
     // Get current buffer and file size
-    sqlite_stmt_handle stmt = prepare_query(db, "SELECT buffer, size FROM entries WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, entry);
-    sqlite3_step(stmt.get());
-
-    cl::Buffer* old_ocl_buf = reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt.get(), 0));
-    size_t current_size = sqlite3_column_int64(stmt.get(), 1);
+    cl::Buffer* old_ocl_buf;
+    size_t current_size;
+    get_buffer(db, entry, &old_ocl_buf, &current_size);
 
     // Allocate buffer for new file size (if != 0)
     cl::Buffer* ocl_buf = nullptr;
@@ -483,11 +487,7 @@ static int vram_truncate(const char* path, off_t size) {
     delete old_ocl_buf;
 
     // Update buffer and size in database
-    stmt = prepare_query(db, "UPDATE entries SET buffer = ?, size = ? WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, reinterpret_cast<int64_t>(ocl_buf));
-    sqlite3_bind_int64(stmt.get(), 2, size);
-    sqlite3_bind_int64(stmt.get(), 3, entry);
-    sqlite3_step(stmt.get());
+    set_buffer(db, entry, ocl_buf, size);
 
     return 0;
 }
@@ -498,7 +498,7 @@ static int vram_truncate(const char* path, off_t size) {
 
 static void vram_destroy(void* userdata) {
     // Clean up active OpenCL buffers
-    sqlite_stmt_handle stmt = prepare_query(db, "SELECT buffer FROM entries");
+    auto stmt = prepare_query(db, "SELECT buffer FROM entries");
 
     while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
         delete reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt.get(), 0));

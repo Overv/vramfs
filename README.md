@@ -14,7 +14,7 @@ Requirements
 
 - Linux
 - FUSE + SQLite3 development files
-- A graphics card with support for OpenCL 1.1+
+- A graphics card with support for OpenCL 1.2+
 
 Instructions
 ------------

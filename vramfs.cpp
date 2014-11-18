@@ -342,6 +342,32 @@ static int vram_mkdir(const char* path, mode_t) {
 }
 
 /*
+ * Rename entry
+ */
+
+static int vram_rename(const char* path, const char* new_path) {
+    // Look up entry
+    int64_t entry = index_find(db, path);
+    if (entry < 0) return entry;
+
+    // Check if destination directory exists
+    std::string dir, new_name;
+    split_file_path(new_path, dir, new_name);
+
+    int64_t parent = index_find(db, dir.c_str(), entry_filter::directory);
+    if (parent < 0) return parent;
+
+    // Update index
+    auto stmt = prepare_query(db, "UPDATE entries SET parent = ?, name = ? WHERE id = ?");
+    sqlite3_bind_int64(stmt.get(), 1, parent);
+    sqlite3_bind_text(stmt.get(), 2, new_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 3, entry);
+    sqlite3_step(stmt.get());
+
+    return 0;
+}
+
+/*
  * Delete file
  */
 
@@ -523,6 +549,7 @@ static struct vram_operations : fuse_operations {
         utimens = vram_utimens;
         readdir = vram_readdir;
         create = vram_create;
+        rename = vram_rename;
         mkdir = vram_mkdir;
         unlink = vram_unlink;
         rmdir = vram_rmdir;

@@ -13,7 +13,6 @@
 #include <mutex>
 
 // Internal dependencies
-#include "resources.hpp"
 #include "types.hpp"
 
 // Configuration
@@ -43,11 +42,13 @@ static const int ROOT_ENTRY = 1;
  * Globals
  */
 
-// Connection to file system database shared by threads (using serialized mode)
-sqlite3* db;
+// Lock to prevent multiple threads from manipulating the file system index and
+// OpenCL buffers simultaneously. The tiny overhead is worth not having to deal
+// with the uncountable amount of race conditions that would otherwise occur.
+std::mutex fslock;
 
-// Lock for creating new entries (to avoid last insert rowid race conditions)
-std::mutex entry_create_lock;
+// Connection to file system database
+sqlite3* db;
 
 // OpenCL context
 cl::Context* ocl_context;
@@ -201,6 +202,8 @@ static void* vram_init(fuse_conn_info* conn) {
  */
 
 static int vram_getattr(const char* path, struct stat* stbuf) {
+    scoped_lock local_lock(fslock);
+
     // Look up entry
     int64_t entry = index_find(db, path);
     if (entry < 0) return entry;
@@ -235,6 +238,8 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
  */
 
 static int vram_utimens(const char* path, const timespec tv[2]) {
+    scoped_lock local_lock(fslock);
+
     // Look up entry
     int64_t entry = index_find(db, path);
     if (entry < 0) return entry;
@@ -254,6 +259,8 @@ static int vram_utimens(const char* path, const timespec tv[2]) {
  */
 
 static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, fuse_file_info*) {
+    scoped_lock local_lock(fslock);
+
     // Look up directory
     int64_t entry = index_find(db, path, entry_filter::directory);
 
@@ -283,6 +290,8 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
  */
 
 static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
+    scoped_lock local_lock(fslock);
+
     // Fail if file already exists
     int64_t entry = index_find(db, path);
     if (entry > 0) return -EEXIST;
@@ -296,17 +305,13 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     if (entry < 0) return entry;
 
     // Create new file
-    entry_create_lock.lock();
+    auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, size) VALUES (?, ?, 0)");
+    sqlite3_bind_int64(stmt.get(), 1, entry);
+    sqlite3_bind_text(stmt.get(), 2, file.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
 
-        auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, size) VALUES (?, ?, 0)");
-        sqlite3_bind_int64(stmt.get(), 1, entry);
-        sqlite3_bind_text(stmt.get(), 2, file.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(stmt.get());
-
-        // Open it by assigning new file handle
-        fi->fh = sqlite3_last_insert_rowid(db);
-
-    entry_create_lock.unlock();
+    // Open it by assigning new file handle
+    fi->fh = sqlite3_last_insert_rowid(db);
 
     return 0;
 }
@@ -316,6 +321,8 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
  */
 
 static int vram_mkdir(const char* path, mode_t) {
+    scoped_lock local_lock(fslock);
+
     // Fail if directory already exists
     int64_t entry = index_find(db, path);
     if (entry > 0) return -EEXIST;
@@ -329,14 +336,10 @@ static int vram_mkdir(const char* path, mode_t) {
     if (entry < 0) return entry;
 
     // Create new directory
-    entry_create_lock.lock();
-
-        auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, dir, size) VALUES (?, ?, 1, 0)");
-        sqlite3_bind_int64(stmt.get(), 1, entry);
-        sqlite3_bind_text(stmt.get(), 2, dir.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_step(stmt.get());
-
-    entry_create_lock.unlock();
+    auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, dir, size) VALUES (?, ?, 1, 0)");
+    sqlite3_bind_int64(stmt.get(), 1, entry);
+    sqlite3_bind_text(stmt.get(), 2, dir.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt.get());
 
     return 0;
 }
@@ -346,6 +349,8 @@ static int vram_mkdir(const char* path, mode_t) {
  */
 
 static int vram_unlink(const char* path) {
+    scoped_lock local_lock(fslock);
+
     // Fail if entry doesn't exist or is a directory
     int64_t entry = index_find(db, path, entry_filter::file);
     if (entry < 0) return entry;
@@ -368,6 +373,8 @@ static int vram_unlink(const char* path) {
  */
 
 static int vram_rmdir(const char* path) {
+    scoped_lock local_lock(fslock);
+
     // Fail if entry doesn't exist or is a file
     int64_t entry = index_find(db, path, entry_filter::directory);
     if (entry < 0) return entry;
@@ -394,6 +401,8 @@ static int vram_rmdir(const char* path) {
  */
 
 static int vram_rename(const char* path, const char* new_path) {
+    scoped_lock local_lock(fslock);
+
     // Look up entry
     int64_t entry = index_find(db, path);
     if (entry < 0) return entry;
@@ -424,6 +433,8 @@ static int vram_rename(const char* path, const char* new_path) {
  */
 
 static int vram_open(const char* path, fuse_file_info* fi) {
+    scoped_lock local_lock(fslock);
+
     // Look up file
     int64_t entry = index_find(db, path, entry_filter::file);
 
@@ -441,6 +452,8 @@ static int vram_open(const char* path, fuse_file_info* fi) {
  */
 
 static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_file_info* fi) {
+    scoped_lock local_lock(fslock);
+
     // Get associated OpenCL buffer and file size
     cl::Buffer* ocl_buf;
     size_t entry_size;
@@ -463,6 +476,8 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
  */
 
 static int vram_write(const char* path, const char* buf, size_t size, off_t off, fuse_file_info* fi) {
+    scoped_lock local_lock(fslock);
+
     if (size == 0) return 0;
 
     // Get current buffer and file size
@@ -506,6 +521,8 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
  */
 
 static int vram_truncate(const char* path, off_t size) {
+    scoped_lock local_lock(fslock);
+
     // Look up entry
     int64_t entry = index_find(db, path, entry_filter::file);
     if (entry < 0) return entry;

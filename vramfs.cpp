@@ -447,12 +447,15 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
     get_buffer(db, fi->fh, &ocl_buf, &entry_size);
     if (ocl_buf == nullptr) return 0;
 
-    // Read data (limit read size to not exceed EOF)
-    size_t read_size = std::min(off + size, entry_size);
-    int r = ocl_queue->enqueueReadBuffer(*ocl_buf, true, off, read_size, buf, nullptr, nullptr);
+    // Cut off read if it exceeds EOF
+    if ((size_t) off >= entry_size) return 0;
+    else if (off + size > entry_size) size = entry_size - off;
+
+    // Read data
+    int r = ocl_queue->enqueueReadBuffer(*ocl_buf, true, off, size, buf, nullptr, nullptr);
     if (r != CL_SUCCESS) return 0;
 
-    return read_size;
+    return size;
 }
 
 /*

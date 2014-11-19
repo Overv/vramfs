@@ -342,32 +342,6 @@ static int vram_mkdir(const char* path, mode_t) {
 }
 
 /*
- * Rename entry
- */
-
-static int vram_rename(const char* path, const char* new_path) {
-    // Look up entry
-    int64_t entry = index_find(db, path);
-    if (entry < 0) return entry;
-
-    // Check if destination directory exists
-    std::string dir, new_name;
-    split_file_path(new_path, dir, new_name);
-
-    int64_t parent = index_find(db, dir.c_str(), entry_filter::directory);
-    if (parent < 0) return parent;
-
-    // Update index
-    auto stmt = prepare_query(db, "UPDATE entries SET parent = ?, name = ? WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, parent);
-    sqlite3_bind_text(stmt.get(), 2, new_name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt.get(), 3, entry);
-    sqlite3_step(stmt.get());
-
-    return 0;
-}
-
-/*
  * Delete file
  */
 
@@ -416,6 +390,36 @@ static int vram_rmdir(const char* path) {
 }
 
 /*
+ * Rename entry
+ */
+
+static int vram_rename(const char* path, const char* new_path) {
+    // Look up entry
+    int64_t entry = index_find(db, path);
+    if (entry < 0) return entry;
+
+    // Check if destination directory exists
+    std::string dir, new_name;
+    split_file_path(new_path, dir, new_name);
+
+    int64_t parent = index_find(db, dir.c_str(), entry_filter::directory);
+    if (parent < 0) return parent;
+
+    // If the destination file already exists, then delete it
+    int64_t dest_entry = index_find(db, new_path);
+    if (dest_entry >= 0) vram_unlink(new_path);
+
+    // Update index
+    auto stmt = prepare_query(db, "UPDATE entries SET parent = ?, name = ? WHERE id = ?");
+    sqlite3_bind_int64(stmt.get(), 1, parent);
+    sqlite3_bind_text(stmt.get(), 2, new_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt.get(), 3, entry);
+    sqlite3_step(stmt.get());
+
+    return 0;
+}
+
+/*
  * Open file
  */
 
@@ -456,22 +460,40 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
  */
 
 static int vram_write(const char* path, const char* buf, size_t size, off_t off, fuse_file_info* fi) {
-    // Discard any old buffer
-    cl::Buffer* old_ocl_buf;
-    get_buffer(db, fi->fh, &old_ocl_buf, nullptr);
-    delete old_ocl_buf;
+    if (size == 0) return 0;
 
-    // Create OpenCL buffer for contents
+    // Get current buffer and file size
     int r;
-    auto ocl_buf = new cl::Buffer(*ocl_context, CL_MEM_READ_WRITE, size, nullptr, &r);
-    if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", -ENOMEM);
+    cl::Buffer* ocl_buf;
+    size_t current_size;
+    get_buffer(db, fi->fh, &ocl_buf, &current_size);
+
+    // Check if buffer needs to be resized
+    if (off + size > current_size) {
+        // Allocate new larger buffer
+        cl::Buffer* old_ocl_buf = ocl_buf;
+        size_t new_file_size = off + size;
+
+        ocl_buf = new cl::Buffer(*ocl_context, CL_MEM_READ_WRITE, new_file_size, nullptr, &r);
+        if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", -ENOMEM);
+
+        // Initialise buffer with zeroes and then copy any old data
+        r = ocl_queue->enqueueFillBuffer(*ocl_buf, 0, 0, new_file_size, nullptr, nullptr);
+        if (r != CL_SUCCESS) return fatal_error("failed to initialise opencl buffer", -EIO);
+
+        if (old_ocl_buf) {
+            r = ocl_queue->enqueueCopyBuffer(*old_ocl_buf, *ocl_buf, 0, 0, current_size, nullptr, nullptr);
+            if (r != CL_SUCCESS) return fatal_error("failed to copy opencl buffer", -EIO);
+        }
+
+        delete old_ocl_buf;
+
+        set_buffer(db, fi->fh, ocl_buf, new_file_size);
+    }
 
     // Copy contents to it
-    r = ocl_queue->enqueueWriteBuffer(*ocl_buf, true, 0, size, buf, nullptr, nullptr);
+    r = ocl_queue->enqueueWriteBuffer(*ocl_buf, true, off, size, buf, nullptr, nullptr);
     if (r != CL_SUCCESS) return fatal_error("failed to write to opencl buffer", -EIO);
-
-    // Store reference to buffer in database and update size
-    set_buffer(db, fi->fh, ocl_buf, size);
 
     return size;
 }
@@ -549,10 +571,10 @@ static struct vram_operations : fuse_operations {
         utimens = vram_utimens;
         readdir = vram_readdir;
         create = vram_create;
-        rename = vram_rename;
         mkdir = vram_mkdir;
         unlink = vram_unlink;
         rmdir = vram_rmdir;
+        rename = vram_rename;
         open = vram_open;
         read = vram_read;
         write = vram_write;

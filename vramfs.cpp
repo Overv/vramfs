@@ -400,6 +400,9 @@ static int vram_mkdir(const char* path, mode_t) {
 
 /*
  * Delete file
+ *
+ * NOTE: FUSE will only call this function once the last handle to a file has
+ * been closed.
  */
 
 static int vram_unlink(const char* path) {

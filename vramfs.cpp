@@ -145,6 +145,21 @@ static int resize_buffer(sqlite3* db, int64_t entry, size_t new_size, cl::Buffer
     return 0;
 }
 
+// Delete a file entry and its buffer
+static int delete_file(sqlite3* db, int64_t entry) {
+    // Delete OpenCL buffer
+    cl::Buffer* ocl_buf;
+    get_buffer(db, entry, &ocl_buf, nullptr);
+    delete ocl_buf;
+
+    // Remove file
+    auto stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
+    sqlite3_bind_int64(stmt.get(), 1, entry);
+    sqlite3_step(stmt.get());
+
+    return 0;
+}
+
 // Find entry by path (starting with /)
 static int64_t index_find(sqlite3* db, const char* path, entry_filter::entry_filter_t filter = entry_filter::all) {
     // Prepare entry lookup query
@@ -394,15 +409,7 @@ static int vram_unlink(const char* path) {
     int64_t entry = index_find(db, path, entry_filter::file);
     if (entry < 0) return entry;
 
-    // Delete OpenCL buffer
-    cl::Buffer* ocl_buf;
-    get_buffer(db, entry, &ocl_buf, nullptr);
-    delete ocl_buf;
-
-    // Remove file
-    auto stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, entry);
-    sqlite3_step(stmt.get());
+    delete_file(db, entry);
 
     return 0;
 }
@@ -455,7 +462,7 @@ static int vram_rename(const char* path, const char* new_path) {
 
     // If the destination file already exists, then delete it
     int64_t dest_entry = index_find(db, new_path);
-    if (dest_entry >= 0) vram_unlink(new_path);
+    if (dest_entry >= 0) delete_file(db, dest_entry);
 
     // Update index
     auto stmt = prepare_query(db, "UPDATE entries SET parent = ?, name = ? WHERE id = ?");
@@ -527,7 +534,8 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
 
     // Resize buffer if necessary
     if (off + size > current_size) {
-        resize_buffer(db, fi->fh, off + size, &ocl_buf);
+        r = resize_buffer(db, fi->fh, off + size, &ocl_buf);
+        if (r < 0) return r;
     }
 
     // Copy contents to it
@@ -549,7 +557,8 @@ static int vram_truncate(const char* path, off_t size) {
     if (entry < 0) return entry;
 
     // Resize file
-    resize_buffer(db, entry, size);
+    int r = resize_buffer(db, entry, size);
+    if (r < 0) return r;
 
     return 0;
 }

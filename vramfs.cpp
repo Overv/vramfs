@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdint>
 #include <mutex>
+#include <unordered_map>
 
 // Internal dependencies
 #include "types.hpp"
@@ -45,14 +46,17 @@ static const int ROOT_ENTRY = 1;
 // Lock to prevent multiple threads from manipulating the file system index and
 // OpenCL buffers simultaneously. The tiny overhead is worth not having to deal
 // with the uncountable amount of race conditions that would otherwise occur.
-std::mutex fslock;
+static std::mutex fslock;
 
 // Connection to file system database
-sqlite3* db;
+static sqlite3* db;
 
 // OpenCL context
-cl::Context* ocl_context;
-cl::CommandQueue* ocl_queue;
+static cl::Context* ocl_context;
+static cl::CommandQueue* ocl_queue;
+
+// Prepared statement cache
+static std::unordered_map<std::string, sqlite3_stmt*> prepared_statements;
 
 /*
  * Helpers
@@ -66,10 +70,20 @@ static T fatal_error(const char* error, T ret) {
     return ret;
 }
 
-static sqlite_stmt_handle prepare_query(sqlite3* db, const char* query) {
+static sqlite3_stmt* prepare_query(sqlite3* db, const char* query) {
+    auto it = prepared_statements.find(query);
     sqlite3_stmt* stmt = nullptr;
-    sqlite3_prepare_v2(db, query, -1, &stmt, nullptr);
-    return sqlite_stmt_handle(stmt);
+
+    if (it == prepared_statements.end()) {
+        sqlite3_prepare_v2(db, query, -1, &stmt, nullptr);
+        prepared_statements[query] = stmt;
+    } else {
+        stmt = prepared_statements[query];
+    }
+
+    sqlite3_reset(stmt);
+
+    return stmt;
 }
 
 // Split path/to/file.txt into "path/to" and "file.txt"
@@ -88,22 +102,22 @@ static void split_file_path(const std::string& path, std::string& dir, std::stri
 // Retrieve current file buffer and entry
 static void get_buffer(sqlite3* db, int64_t entry, cl::Buffer** buffer = nullptr, size_t* size = nullptr) {
     auto stmt = prepare_query(db, "SELECT buffer, size FROM entries WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, entry);
-    sqlite3_step(stmt.get());
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_step(stmt);
 
     if (buffer)
-        *buffer = reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt.get(), 0));
+        *buffer = reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
     if (size)
-        *size = sqlite3_column_int64(stmt.get(), 1);
+        *size = sqlite3_column_int64(stmt, 1);
 }
 
 // Set file buffer and size of entry
 static void set_buffer(sqlite3* db, int64_t entry, cl::Buffer* buffer, size_t size) {
     auto stmt = prepare_query(db, "UPDATE entries SET buffer = ?, size = ? WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, reinterpret_cast<int64_t>(buffer));
-    sqlite3_bind_int64(stmt.get(), 2, size);
-    sqlite3_bind_int64(stmt.get(), 3, entry);
-    sqlite3_step(stmt.get());
+    sqlite3_bind_int64(stmt, 1, reinterpret_cast<int64_t>(buffer));
+    sqlite3_bind_int64(stmt, 2, size);
+    sqlite3_bind_int64(stmt, 3, entry);
+    sqlite3_step(stmt);
 }
 
 // Resize file buffer (updates database)
@@ -154,8 +168,8 @@ static int delete_file(sqlite3* db, int64_t entry) {
 
     // Remove file
     auto stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, entry);
-    sqlite3_step(stmt.get());
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_step(stmt);
 
     return 0;
 }
@@ -181,9 +195,9 @@ static int64_t index_find(sqlite3* db, const char* path, entry_filter::entry_fil
         }
 
         // Look up corresponding entry in the current directory
-        sqlite3_bind_int64(stmt.get(), 1, entry);
-        sqlite3_bind_text(stmt.get(), 2, part.c_str(), -1, SQLITE_TRANSIENT);
-        int r = sqlite3_step(stmt.get());
+        sqlite3_bind_int64(stmt, 1, entry);
+        sqlite3_bind_text(stmt, 2, part.c_str(), -1, SQLITE_TRANSIENT);
+        int r = sqlite3_step(stmt);
 
         // If entry was not found, abort
         if (r != SQLITE_ROW) {
@@ -192,10 +206,10 @@ static int64_t index_find(sqlite3* db, const char* path, entry_filter::entry_fil
         }
 
         // Continue with entry as new current directory (if not end of path)
-        entry = sqlite3_column_int64(stmt.get(), 0);
-        dir = sqlite3_column_int(stmt.get(), 1);
+        entry = sqlite3_column_int64(stmt, 0);
+        dir = sqlite3_column_int(stmt, 1);
 
-        sqlite3_reset(stmt.get());
+        sqlite3_reset(stmt);
     }
 
     // If the path is empty, assume the root directory
@@ -264,12 +278,12 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
 
     // Load all info about the entry
     auto stmt = prepare_query(db, "SELECT dir, size, atime, mtime, ctime FROM entries WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, entry);
-    sqlite3_step(stmt.get());
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_step(stmt);
 
     memset(stbuf, 0, sizeof(struct stat));
 
-    if (sqlite3_column_int(stmt.get(), 0)) {
+    if (sqlite3_column_int(stmt, 0)) {
         stbuf->st_mode = S_IFDIR | 0700;
         stbuf->st_nlink = 2;
     } else {
@@ -279,10 +293,10 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
 
     stbuf->st_uid = geteuid();
     stbuf->st_gid = getegid();
-    stbuf->st_size = sqlite3_column_int64(stmt.get(), 1);
-    stbuf->st_atime = sqlite3_column_int64(stmt.get(), 2);
-    stbuf->st_mtime = sqlite3_column_int64(stmt.get(), 3);
-    stbuf->st_ctime = sqlite3_column_int64(stmt.get(), 4);
+    stbuf->st_size = sqlite3_column_int64(stmt, 1);
+    stbuf->st_atime = sqlite3_column_int64(stmt, 2);
+    stbuf->st_mtime = sqlite3_column_int64(stmt, 3);
+    stbuf->st_ctime = sqlite3_column_int64(stmt, 4);
 
     return 0;
 }
@@ -300,10 +314,10 @@ static int vram_utimens(const char* path, const timespec tv[2]) {
 
     // Update times (ignore nanosecond part)
     auto stmt = prepare_query(db, "UPDATE entries SET atime = ?, mtime = ?, ctime = STRFTIME('%s') WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, tv[0].tv_sec);
-    sqlite3_bind_int64(stmt.get(), 2, tv[1].tv_sec);
-    sqlite3_bind_int64(stmt.get(), 3, entry);
-    sqlite3_step(stmt.get());
+    sqlite3_bind_int64(stmt, 1, tv[0].tv_sec);
+    sqlite3_bind_int64(stmt, 2, tv[1].tv_sec);
+    sqlite3_bind_int64(stmt, 3, entry);
+    sqlite3_step(stmt);
 
     return 0;
 }
@@ -320,15 +334,15 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
 
     if (entry > 0) {
         // List directory contents
-        sqlite_stmt_handle stmt = prepare_query(db, "SELECT name FROM entries WHERE parent = ?");
-        sqlite3_bind_int64(stmt.get(), 1, entry);
+        auto stmt = prepare_query(db, "SELECT name FROM entries WHERE parent = ?");
+        sqlite3_bind_int64(stmt, 1, entry);
 
         // Required default entries
         filler(buf, ".", nullptr, 0);
         filler(buf, "..", nullptr, 0);
 
-        while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-            const unsigned char* name = sqlite3_column_text(stmt.get(), 0);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            const unsigned char* name = sqlite3_column_text(stmt, 0);
             filler(buf, reinterpret_cast<const char*>(name), nullptr, 0);
         }
 
@@ -360,9 +374,9 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
 
     // Create new file
     auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, size) VALUES (?, ?, 0)");
-    sqlite3_bind_int64(stmt.get(), 1, entry);
-    sqlite3_bind_text(stmt.get(), 2, file.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt.get());
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_bind_text(stmt, 2, file.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
 
     // Open it by assigning new file handle
     fi->fh = sqlite3_last_insert_rowid(db);
@@ -391,9 +405,9 @@ static int vram_mkdir(const char* path, mode_t) {
 
     // Create new directory
     auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, dir, size) VALUES (?, ?, 1, 0)");
-    sqlite3_bind_int64(stmt.get(), 1, entry);
-    sqlite3_bind_text(stmt.get(), 2, dir.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_step(stmt.get());
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_bind_text(stmt, 2, dir.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_step(stmt);
 
     return 0;
 }
@@ -430,17 +444,17 @@ static int vram_rmdir(const char* path) {
 
     // Check if directory is empty
     auto stmt = prepare_query(db, "SELECT COUNT(*) FROM entries WHERE parent = ?");
-    sqlite3_bind_int64(stmt.get(), 1, entry);
-    sqlite3_step(stmt.get());
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_step(stmt);
 
-    if (sqlite3_column_int64(stmt.get(), 0) != 0) {
+    if (sqlite3_column_int64(stmt, 0) != 0) {
         return -ENOTEMPTY;
     }
 
     // Remove directory
     stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, entry);
-    sqlite3_step(stmt.get());
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_step(stmt);
 
     return 0;
 }
@@ -469,10 +483,10 @@ static int vram_rename(const char* path, const char* new_path) {
 
     // Update index
     auto stmt = prepare_query(db, "UPDATE entries SET parent = ?, name = ? WHERE id = ?");
-    sqlite3_bind_int64(stmt.get(), 1, parent);
-    sqlite3_bind_text(stmt.get(), 2, new_name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int64(stmt.get(), 3, entry);
-    sqlite3_step(stmt.get());
+    sqlite3_bind_int64(stmt, 1, parent);
+    sqlite3_bind_text(stmt, 2, new_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 3, entry);
+    sqlite3_step(stmt);
 
     return 0;
 }
@@ -574,13 +588,18 @@ static void vram_destroy(void* userdata) {
     // Clean up active OpenCL buffers
     auto stmt = prepare_query(db, "SELECT buffer FROM entries");
 
-    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
-        delete reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt.get(), 0));
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        delete reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
     }
 
     // Clean up OpenCL context
     delete ocl_queue;
     delete ocl_context;
+
+    // Clean up prepared statements
+    for (auto& pair : prepared_statements) {
+        sqlite3_finalize(pair.second);
+    }
 
     // Clean up index database
     sqlite3_close(reinterpret_cast<sqlite3*>(userdata));

@@ -3,7 +3,13 @@
 #include <fuse.h>
 #include <sqlite3.h>
 #include <unistd.h>
+
+// Use minimal OpenCL implementation for better debugging with valgrind
+#ifndef DEBUG
+#include "extras/debugcl.hpp"
+#else
 #include <CL/cl.hpp>
+#endif
 
 // Standard library
 #include <iostream>

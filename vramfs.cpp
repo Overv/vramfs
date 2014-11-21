@@ -85,8 +85,8 @@ static void split_file_path(const std::string& path, std::string& dir, std::stri
     }
 }
 
-// Retrieve current file buffer and entry (both may be nullptr)
-static void get_buffer(sqlite3* db, int64_t entry, cl::Buffer** buffer, size_t* size) {
+// Retrieve current file buffer and entry
+static void get_buffer(sqlite3* db, int64_t entry, cl::Buffer** buffer = nullptr, size_t* size = nullptr) {
     auto stmt = prepare_query(db, "SELECT buffer, size FROM entries WHERE id = ?");
     sqlite3_bind_int64(stmt.get(), 1, entry);
     sqlite3_step(stmt.get());
@@ -104,6 +104,45 @@ static void set_buffer(sqlite3* db, int64_t entry, cl::Buffer* buffer, size_t si
     sqlite3_bind_int64(stmt.get(), 2, size);
     sqlite3_bind_int64(stmt.get(), 3, entry);
     sqlite3_step(stmt.get());
+}
+
+// Resize file buffer (updates database)
+static int resize_buffer(sqlite3* db, int64_t entry, size_t new_size, cl::Buffer** new_buf = nullptr) {
+    // Get current buffer and file size
+    int r;
+    cl::Buffer* ocl_buf;
+    size_t current_size;
+    get_buffer(db, entry, &ocl_buf, &current_size);
+
+    // Allocate new larger buffer if size > 0
+    cl::Buffer* old_ocl_buf = ocl_buf;
+
+    if (new_size != 0) {
+        ocl_buf = new cl::Buffer(*ocl_context, CL_MEM_READ_WRITE, new_size, nullptr, &r);
+        if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", -ENOMEM);
+
+        // Initialise buffer with zeroes and then copy any old data
+        r = ocl_queue->enqueueFillBuffer(*ocl_buf, 0, 0, new_size, nullptr, nullptr);
+        if (r != CL_SUCCESS) return fatal_error("failed to initialise opencl buffer", -EIO);
+
+        if (old_ocl_buf) {
+            size_t copy_size = std::min(new_size, current_size);
+            r = ocl_queue->enqueueCopyBuffer(*old_ocl_buf, *ocl_buf, 0, 0, copy_size, nullptr, nullptr);
+            if (r != CL_SUCCESS) return fatal_error("failed to copy opencl buffer", -EIO);
+        }
+    } else {
+        ocl_buf = nullptr;
+    }
+
+    // Dispose of any old buffer
+    delete old_ocl_buf;
+
+    // Update file database
+    set_buffer(db, entry, ocl_buf, new_size);
+
+    if (new_buf) *new_buf = ocl_buf;
+
+    return 0;
 }
 
 // Find entry by path (starting with /)
@@ -486,27 +525,9 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
     size_t current_size;
     get_buffer(db, fi->fh, &ocl_buf, &current_size);
 
-    // Check if buffer needs to be resized
+    // Resize buffer if necessary
     if (off + size > current_size) {
-        // Allocate new larger buffer
-        cl::Buffer* old_ocl_buf = ocl_buf;
-        size_t new_file_size = off + size;
-
-        ocl_buf = new cl::Buffer(*ocl_context, CL_MEM_READ_WRITE, new_file_size, nullptr, &r);
-        if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", -ENOMEM);
-
-        // Initialise buffer with zeroes and then copy any old data
-        r = ocl_queue->enqueueFillBuffer(*ocl_buf, 0, 0, new_file_size, nullptr, nullptr);
-        if (r != CL_SUCCESS) return fatal_error("failed to initialise opencl buffer", -EIO);
-
-        if (old_ocl_buf) {
-            r = ocl_queue->enqueueCopyBuffer(*old_ocl_buf, *ocl_buf, 0, 0, current_size, nullptr, nullptr);
-            if (r != CL_SUCCESS) return fatal_error("failed to copy opencl buffer", -EIO);
-        }
-
-        delete old_ocl_buf;
-
-        set_buffer(db, fi->fh, ocl_buf, new_file_size);
+        resize_buffer(db, fi->fh, off + size, &ocl_buf);
     }
 
     // Copy contents to it
@@ -527,35 +548,8 @@ static int vram_truncate(const char* path, off_t size) {
     int64_t entry = index_find(db, path, entry_filter::file);
     if (entry < 0) return entry;
 
-    // Get current buffer and file size
-    cl::Buffer* old_ocl_buf;
-    size_t current_size;
-    get_buffer(db, entry, &old_ocl_buf, &current_size);
-
-    // Allocate buffer for new file size (if != 0)
-    cl::Buffer* ocl_buf = nullptr;
-
-    if (size != 0) {
-        int r;
-        ocl_buf = new cl::Buffer(*ocl_context, CL_MEM_READ_WRITE, size, nullptr, &r);
-        if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", -ENOMEM);
-
-        // Initialise buffer with zeroes and then copy any old data
-        r = ocl_queue->enqueueFillBuffer(*ocl_buf, 0, 0, size, nullptr, nullptr);
-        if (r != CL_SUCCESS) return fatal_error("failed to initialise opencl buffer", -EIO);
-
-        if (old_ocl_buf) {
-            size_t copy_size = std::min(current_size, (size_t) size);
-            r = ocl_queue->enqueueCopyBuffer(*old_ocl_buf, *ocl_buf, 0, 0, copy_size, nullptr, nullptr);
-            if (r != CL_SUCCESS) return fatal_error("failed to copy opencl buffer", -EIO);
-        }
-    }
-
-    // Delete old buffer (can be nullptr)
-    delete old_ocl_buf;
-
-    // Update buffer and size in database
-    set_buffer(db, entry, ocl_buf, size);
+    // Resize file
+    resize_buffer(db, entry, size);
 
     return 0;
 }

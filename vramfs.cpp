@@ -5,7 +5,7 @@
 #include <unistd.h>
 
 // Use minimal OpenCL implementation for better debugging with valgrind
-#ifndef DEBUG
+#ifdef DEBUG
 #include "extras/debugcl.hpp"
 #else
 #include <CL/cl.hpp>
@@ -30,6 +30,7 @@ static const char* entries_table_sql =
         "parent INTEGER DEFAULT 0," \
         "name TEXT NOT NULL," \
         "dir INTEGER DEFAULT 0," \
+        "mode INTEGER DEFAULT 0," \
         "size INTEGER DEFAULT 4096," \
         // Numeric version of CURRENT_TIMESTAMP
         "atime INTEGER DEFAULT (STRFTIME('%s'))," \
@@ -44,6 +45,9 @@ static const char* root_entry_sql =
 
 static const int ROOT_PARENT = 0;
 static const int ROOT_ENTRY = 1;
+
+static const int DEFAULT_FILE_MODE = 0664;
+static const int DEFAULT_DIR_MODE = 0775;
 
 /*
  * Globals
@@ -283,26 +287,49 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
     if (entry < 0) return entry;
 
     // Load all info about the entry
-    auto stmt = prepare_query(db, "SELECT dir, size, atime, mtime, ctime FROM entries WHERE id = ?");
+    auto stmt = prepare_query(db, "SELECT dir, mode, size, atime, mtime, ctime FROM entries WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_step(stmt);
 
     memset(stbuf, 0, sizeof(struct stat));
 
-    if (sqlite3_column_int(stmt, 0)) {
-        stbuf->st_mode = S_IFDIR | 0700;
+    bool dir = sqlite3_column_int(stmt, 0);
+    int mode = sqlite3_column_int(stmt, 1);
+
+    if (dir) {
+        stbuf->st_mode = S_IFDIR | mode;
         stbuf->st_nlink = 2;
     } else {
-        stbuf->st_mode = S_IFREG | 0600;
+        stbuf->st_mode = S_IFREG | mode;
         stbuf->st_nlink = 1;
     }
 
     stbuf->st_uid = geteuid();
     stbuf->st_gid = getegid();
-    stbuf->st_size = sqlite3_column_int64(stmt, 1);
-    stbuf->st_atime = sqlite3_column_int64(stmt, 2);
-    stbuf->st_mtime = sqlite3_column_int64(stmt, 3);
-    stbuf->st_ctime = sqlite3_column_int64(stmt, 4);
+    stbuf->st_size = sqlite3_column_int64(stmt, 2);
+    stbuf->st_atime = sqlite3_column_int64(stmt, 3);
+    stbuf->st_mtime = sqlite3_column_int64(stmt, 4);
+    stbuf->st_ctime = sqlite3_column_int64(stmt, 5);
+
+    return 0;
+}
+
+/*
+ * Set the mode bits of an entry
+ */
+
+static int vram_chmod(const char* path, mode_t mode) {
+    scoped_lock local_lock(fslock);
+
+    // Look up entry
+    int64_t entry = index_find(db, path);
+    if (entry < 0) return entry;
+
+    // Update mode
+    auto stmt = prepare_query(db, "UPDATE entries SET mode = ? WHERE id = ?");
+    sqlite3_bind_int64(stmt, 1, mode);
+    sqlite3_bind_int64(stmt, 2, entry);
+    sqlite3_step(stmt);
 
     return 0;
 }
@@ -379,9 +406,10 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     if (entry < 0) return entry;
 
     // Create new file
-    auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, size) VALUES (?, ?, 0)");
+    auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, mode, size) VALUES (?, ?, ?, 0)");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_bind_text(stmt, 2, file.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 3, DEFAULT_FILE_MODE);
     sqlite3_step(stmt);
 
     // Open it by assigning new file handle
@@ -410,9 +438,10 @@ static int vram_mkdir(const char* path, mode_t) {
     if (entry < 0) return entry;
 
     // Create new directory
-    auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, dir, size) VALUES (?, ?, 1, 0)");
+    auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, mode, dir, size) VALUES (?, ?, ?, 1, 0)");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_bind_text(stmt, 2, dir.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 3, DEFAULT_DIR_MODE);
     sqlite3_step(stmt);
 
     return 0;
@@ -620,6 +649,7 @@ static struct vram_operations : fuse_operations {
         init = vram_init;
         getattr = vram_getattr;
         utimens = vram_utimens;
+        chmod = vram_chmod;
         readdir = vram_readdir;
         create = vram_create;
         mkdir = vram_mkdir;

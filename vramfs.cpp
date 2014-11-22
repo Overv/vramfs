@@ -599,9 +599,31 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
 static int vram_truncate(const char* path, off_t size) {
     scoped_lock local_lock(fslock);
 
-    // TODO: Implement
+    // Look up file
+    int64_t entry = index_find(db, path);
+    if (entry < 0) return entry;
 
-    return -ENOSYS;
+    // Update size
+    auto stmt = prepare_query(db, "UPDATE entries SET size = ? WHERE id = ?");
+    sqlite3_bind_int64(stmt, 1, size);
+    sqlite3_bind_int64(stmt, 2, entry);
+    sqlite3_step(stmt);
+
+    // Discard blocks beyond the new file size
+    stmt = prepare_query(db, "SELECT buffer FROM blocks WHERE entry = ? AND off >= ?");
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_bind_int64(stmt, 2, size);
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        delete reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
+    }
+
+    stmt = prepare_query(db, "DELETE FROM blocks WHERE entry = ? AND off >= ?");
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_bind_int64(stmt, 2, size);
+    sqlite3_step(stmt);
+
+    return 0;
 }
 
 /*

@@ -48,7 +48,7 @@ static const char* blocks_table_sql =
         "buffer INTEGER NOT NULL" \
     ")";
 
-static const size_t BLOCK_SIZE = 4096;
+static const size_t BLOCK_SIZE = 1024 * 1024;
 
 static const int ROOT_PARENT = 0;
 static const int ROOT_ENTRY = 1;
@@ -507,89 +507,108 @@ static int vram_open(const char* path, fuse_file_info* fi) {
 
 /*
  * Read file
- *
- * TODO: Handle multiple blocks
  */
 
 static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
 
-    // Get file size to determine how much to read
+    // Get file size to determine actual read size
     auto stmt = prepare_query(db, "SELECT size FROM entries WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, fi->fh);
     sqlite3_step(stmt);
+
     size_t file_size = sqlite3_column_int64(stmt, 0);
-
     if ((size_t) off >= file_size) return 0;
-    size_t read_size = std::min(file_size - off, size);
 
-    // Find block corresponding to read region
-    off_t block_start = (off / BLOCK_SIZE) * BLOCK_SIZE;
-    off_t block_off = off - block_start;
+    size = std::min(file_size - off, size);
+    size_t total_read = size;
 
-    // Get buffer for block
-    stmt = prepare_query(db, "SELECT buffer FROM blocks WHERE entry = ? AND off = ?");
-    sqlite3_bind_int64(stmt, 1, fi->fh);
-    sqlite3_bind_int64(stmt, 2, block_start);
+    // Walk over blocks in read region
+    off_t end_pos = off + size;
 
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        cl::Buffer* ocl_buf = reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
-        ocl_queue->enqueueReadBuffer(*ocl_buf, true, block_off, read_size, buf, nullptr, nullptr);
-    } else {
-        // Non-written part of file
-        memset(buf, 0, read_size);
+    while (off < end_pos) {
+        // Find block corresponding to current offset
+        off_t block_start = (off / BLOCK_SIZE) * BLOCK_SIZE;
+        off_t block_off = off - block_start;
+        size_t read_size = std::min(BLOCK_SIZE - block_off, size);
+
+        // Get buffer for block
+        stmt = prepare_query(db, "SELECT buffer FROM blocks WHERE entry = ? AND off = ?");
+        sqlite3_bind_int64(stmt, 1, fi->fh);
+        sqlite3_bind_int64(stmt, 2, block_start);
+
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            cl::Buffer* ocl_buf = reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
+            ocl_queue->enqueueReadBuffer(*ocl_buf, true, block_off, read_size, buf, nullptr, nullptr);
+        } else {
+            // Non-written part of file
+            memset(buf, 0, read_size);
+        }
+
+        buf += read_size;
+        off += read_size;
+        size -= read_size;
     }
 
-    return read_size;
+    return total_read;
 }
 
 /*
  * Write file
- *
- * TODO: Handle multiple blocks
  */
 
 static int vram_write(const char* path, const char* buf, size_t size, off_t off, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
 
-    // Find block corresponding to write region
-    off_t block_start = (off / BLOCK_SIZE) * BLOCK_SIZE;
-    off_t block_off = off - block_start;
+    size_t total_write = size;
+    off_t end_pos = off + size;
 
-    // Get buffer for block or allocate a new one
-    auto stmt = prepare_query(db, "SELECT buffer FROM blocks WHERE entry = ? AND off = ?");
-    sqlite3_bind_int64(stmt, 1, fi->fh);
-    sqlite3_bind_int64(stmt, 2, block_start);
+    // Walk over blocks in write region
+    while (off < end_pos) {
+        // Find block corresponding to current offset
+        off_t block_start = (off / BLOCK_SIZE) * BLOCK_SIZE;
+        off_t block_off = off - block_start;
+        size_t write_size = std::min(BLOCK_SIZE - block_off, size);
 
-    cl::Buffer* ocl_buf = nullptr;
-    int r;
-
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        ocl_buf = reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
-    } else {
-        ocl_buf = new cl::Buffer(*ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
-        if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", -ENOMEM);
-
-        r = ocl_queue->enqueueFillBuffer(*ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
-        if (r != CL_SUCCESS) return fatal_error("failed to initialise opencl buffer", -EIO);
-
-        stmt = prepare_query(db, "INSERT INTO blocks (entry, off, buffer) VALUES (?, ?, ?)");
+        // Get buffer for block or allocate a new one
+        auto stmt = prepare_query(db, "SELECT buffer FROM blocks WHERE entry = ? AND off = ?");
         sqlite3_bind_int64(stmt, 1, fi->fh);
         sqlite3_bind_int64(stmt, 2, block_start);
-        sqlite3_bind_int64(stmt, 3, reinterpret_cast<int64_t>(ocl_buf));
-        sqlite3_step(stmt);
+
+        cl::Buffer* ocl_buf = nullptr;
+        int r;
+
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            ocl_buf = reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
+        } else {
+            ocl_buf = new cl::Buffer(*ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
+            if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", -ENOMEM);
+
+            r = ocl_queue->enqueueFillBuffer(*ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
+            if (r != CL_SUCCESS) return fatal_error("failed to initialise opencl buffer", -EIO);
+
+            stmt = prepare_query(db, "INSERT INTO blocks (entry, off, buffer) VALUES (?, ?, ?)");
+            sqlite3_bind_int64(stmt, 1, fi->fh);
+            sqlite3_bind_int64(stmt, 2, block_start);
+            sqlite3_bind_int64(stmt, 3, reinterpret_cast<int64_t>(ocl_buf));
+            sqlite3_step(stmt);
+        }
+
+        // Write to block
+        ocl_queue->enqueueWriteBuffer(*ocl_buf, true, block_off, write_size, buf, nullptr, nullptr);
+
+        buf += write_size;
+        off += write_size;
+        size -= write_size;
     }
 
-    // Write to block
-    ocl_queue->enqueueWriteBuffer(*ocl_buf, true, block_off, size, buf, nullptr, nullptr);
-
     // Update file size
-    stmt = prepare_query(db, "UPDATE entries SET size = MAX(size, ?) WHERE id = ?");
-    sqlite3_bind_int64(stmt, 1, size + off);
+    auto stmt = prepare_query(db, "UPDATE entries SET size = MAX(size, ?) WHERE id = ?");
+    sqlite3_bind_int64(stmt, 1, end_pos);
     sqlite3_bind_int64(stmt, 2, fi->fh);
     sqlite3_step(stmt);
 
-    return size;
+    return total_write;
 }
 
 /*

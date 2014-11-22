@@ -130,16 +130,16 @@ static cl::Buffer* get_block(sqlite3* db, int64_t entry, off_t off) {
     }
 }
 
-// Allocate new block
-static int create_block(sqlite3* db, int64_t entry, off_t off, cl::Buffer** buf) {
+// Allocate new block, buf is only set on success (returning true)
+static bool create_block(sqlite3* db, int64_t entry, off_t off, cl::Buffer** buf) {
     int r;
 
     auto ocl_buf = new cl::Buffer(*ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
-    if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", -ENOMEM);
+    if (r != CL_SUCCESS) return false;
 
     // Initialise with zeros
     r = ocl_queue->enqueueFillBuffer(*ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
-    if (r != CL_SUCCESS) return fatal_error("failed to initialise opencl buffer", -EIO);
+    if (r != CL_SUCCESS) return false;
 
     auto stmt = prepare_query(db, "INSERT INTO blocks (entry, off, buffer) VALUES (?, ?, ?)");
     sqlite3_bind_int64(stmt, 1, entry);
@@ -149,7 +149,7 @@ static int create_block(sqlite3* db, int64_t entry, off_t off, cl::Buffer** buf)
 
     *buf = ocl_buf;
 
-    return 0;
+    return true;
 }
 
 // Delete all blocks with a starting offset >= *off*
@@ -622,8 +622,10 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
         cl::Buffer* ocl_buf = get_block(db, fi->fh, block_start);
 
         if (!ocl_buf) {
-            int r = create_block(db, fi->fh, block_start, &ocl_buf);
-            if (r < 0) return r;
+            bool r = create_block(db, fi->fh, block_start, &ocl_buf);
+
+            // Failed to allocate buffer, likely out of VRAM
+            if (!r) break;
         }
 
         ocl_queue->enqueueWriteBuffer(*ocl_buf, true, block_off, write_size, buf, nullptr, nullptr);
@@ -633,11 +635,15 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
         size -= write_size;
     }
 
-    if (get_file_size(db, fi->fh) < (size_t) end_pos) {
-        set_file_size(db, fi->fh, end_pos);
+    if (get_file_size(db, fi->fh) < (size_t) off) {
+        set_file_size(db, fi->fh, off);
     }
 
-    return total_write;
+    if (off < end_pos) {
+        return -ENOSPC;
+    } else {
+        return total_write;
+    }
 }
 
 /*

@@ -116,26 +116,85 @@ static void split_file_path(const std::string& path, std::string& dir, std::stri
     }
 }
 
-// Delete a file entry and its blocks
-static int delete_file(sqlite3* db, int64_t entry) {
-    // Delete blocks and associated OpenCL buffers
-    auto stmt = prepare_query(db, "SELECT buffer FROM blocks WHERE entry = ?");
+// Get the OpenCL buffer of the block starting at *off* or nullptr if the block
+// hasn't been written yet
+static cl::Buffer* get_block(sqlite3* db, int64_t entry, off_t off) {
+    auto stmt = prepare_query(db, "SELECT buffer FROM blocks WHERE entry = ? AND off = ?");
     sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_bind_int64(stmt, 2, off);
+
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        return reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
+    } else {
+        return nullptr;
+    }
+}
+
+// Allocate new block
+static int create_block(sqlite3* db, int64_t entry, off_t off, cl::Buffer** buf) {
+    int r;
+
+    auto ocl_buf = new cl::Buffer(*ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
+    if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", -ENOMEM);
+
+    // Initialise with zeros
+    r = ocl_queue->enqueueFillBuffer(*ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
+    if (r != CL_SUCCESS) return fatal_error("failed to initialise opencl buffer", -EIO);
+
+    auto stmt = prepare_query(db, "INSERT INTO blocks (entry, off, buffer) VALUES (?, ?, ?)");
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_bind_int64(stmt, 2, off);
+    sqlite3_bind_int64(stmt, 3, reinterpret_cast<int64_t>(ocl_buf));
+    sqlite3_step(stmt);
+
+    *buf = ocl_buf;
+
+    return 0;
+}
+
+// Delete all blocks with a starting offset >= *off*
+static void delete_blocks(sqlite3* db, int64_t entry, off_t off = 0) {
+    auto stmt = prepare_query(db, "SELECT buffer FROM blocks WHERE entry = ? AND off >= ?");
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_bind_int64(stmt, 2, off);
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         delete reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
     }
 
-    stmt = prepare_query(db, "DELETE FROM blocks WHERE entry = ?");
+    stmt = prepare_query(db, "DELETE FROM blocks WHERE entry = ? AND off >= ?");
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_bind_int64(stmt, 2, off);
+    sqlite3_step(stmt);
+}
+
+// Delete a file entry and its blocks
+static int delete_file(sqlite3* db, int64_t entry) {
+    auto stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_step(stmt);
 
-    // Remove file
-    stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
-    sqlite3_bind_int64(stmt, 1, entry);
-    sqlite3_step(stmt);
+    delete_blocks(db, entry);
 
     return 0;
+}
+
+static size_t get_file_size(sqlite3* db, int64_t entry) {
+    auto stmt = prepare_query(db, "SELECT size FROM entries WHERE id = ?");
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_step(stmt);
+
+    return sqlite3_column_int64(stmt, 0);
+}
+
+// Change file size, any blocks beyond the size will be automatically removed
+static void set_file_size(sqlite3* db, int64_t entry, size_t size) {
+    auto stmt = prepare_query(db, "UPDATE entries SET size = ? WHERE id = ?");
+    sqlite3_bind_int64(stmt, 1, size);
+    sqlite3_bind_int64(stmt, 2, entry);
+    sqlite3_step(stmt);
+
+    delete_blocks(db, entry, size);
 }
 
 // Find entry by path (starting with /)
@@ -512,19 +571,13 @@ static int vram_open(const char* path, fuse_file_info* fi) {
 static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
 
-    // Get file size to determine actual read size
-    auto stmt = prepare_query(db, "SELECT size FROM entries WHERE id = ?");
-    sqlite3_bind_int64(stmt, 1, fi->fh);
-    sqlite3_step(stmt);
-
-    size_t file_size = sqlite3_column_int64(stmt, 0);
+    size_t file_size = get_file_size(db, fi->fh);
     if ((size_t) off >= file_size) return 0;
-
     size = std::min(file_size - off, size);
-    size_t total_read = size;
 
     // Walk over blocks in read region
     off_t end_pos = off + size;
+    size_t total_read = size;
 
     while (off < end_pos) {
         // Find block corresponding to current offset
@@ -532,13 +585,9 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
         off_t block_off = off - block_start;
         size_t read_size = std::min(BLOCK_SIZE - block_off, size);
 
-        // Get buffer for block
-        stmt = prepare_query(db, "SELECT buffer FROM blocks WHERE entry = ? AND off = ?");
-        sqlite3_bind_int64(stmt, 1, fi->fh);
-        sqlite3_bind_int64(stmt, 2, block_start);
+        cl::Buffer* ocl_buf = get_block(db, fi->fh, block_start);
 
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            cl::Buffer* ocl_buf = reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
+        if (ocl_buf) {
             ocl_queue->enqueueReadBuffer(*ocl_buf, true, block_off, read_size, buf, nullptr, nullptr);
         } else {
             // Non-written part of file
@@ -560,41 +609,23 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
 static int vram_write(const char* path, const char* buf, size_t size, off_t off, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
 
-    size_t total_write = size;
-    off_t end_pos = off + size;
-
     // Walk over blocks in write region
+    off_t end_pos = off + size;
+    size_t total_write = size;
+
     while (off < end_pos) {
         // Find block corresponding to current offset
         off_t block_start = (off / BLOCK_SIZE) * BLOCK_SIZE;
         off_t block_off = off - block_start;
         size_t write_size = std::min(BLOCK_SIZE - block_off, size);
 
-        // Get buffer for block or allocate a new one
-        auto stmt = prepare_query(db, "SELECT buffer FROM blocks WHERE entry = ? AND off = ?");
-        sqlite3_bind_int64(stmt, 1, fi->fh);
-        sqlite3_bind_int64(stmt, 2, block_start);
+        cl::Buffer* ocl_buf = get_block(db, fi->fh, block_start);
 
-        cl::Buffer* ocl_buf = nullptr;
-        int r;
-
-        if (sqlite3_step(stmt) == SQLITE_ROW) {
-            ocl_buf = reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
-        } else {
-            ocl_buf = new cl::Buffer(*ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
-            if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", -ENOMEM);
-
-            r = ocl_queue->enqueueFillBuffer(*ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
-            if (r != CL_SUCCESS) return fatal_error("failed to initialise opencl buffer", -EIO);
-
-            stmt = prepare_query(db, "INSERT INTO blocks (entry, off, buffer) VALUES (?, ?, ?)");
-            sqlite3_bind_int64(stmt, 1, fi->fh);
-            sqlite3_bind_int64(stmt, 2, block_start);
-            sqlite3_bind_int64(stmt, 3, reinterpret_cast<int64_t>(ocl_buf));
-            sqlite3_step(stmt);
+        if (!ocl_buf) {
+            int r = create_block(db, fi->fh, block_start, &ocl_buf);
+            if (r < 0) return r;
         }
 
-        // Write to block
         ocl_queue->enqueueWriteBuffer(*ocl_buf, true, block_off, write_size, buf, nullptr, nullptr);
 
         buf += write_size;
@@ -602,11 +633,9 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
         size -= write_size;
     }
 
-    // Update file size
-    auto stmt = prepare_query(db, "UPDATE entries SET size = MAX(size, ?) WHERE id = ?");
-    sqlite3_bind_int64(stmt, 1, end_pos);
-    sqlite3_bind_int64(stmt, 2, fi->fh);
-    sqlite3_step(stmt);
+    if (get_file_size(db, fi->fh) < (size_t) end_pos) {
+        set_file_size(db, fi->fh, end_pos);
+    }
 
     return total_write;
 }
@@ -618,29 +647,10 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
 static int vram_truncate(const char* path, off_t size) {
     scoped_lock local_lock(fslock);
 
-    // Look up file
     int64_t entry = index_find(db, path);
     if (entry < 0) return entry;
 
-    // Update size
-    auto stmt = prepare_query(db, "UPDATE entries SET size = ? WHERE id = ?");
-    sqlite3_bind_int64(stmt, 1, size);
-    sqlite3_bind_int64(stmt, 2, entry);
-    sqlite3_step(stmt);
-
-    // Discard blocks beyond the new file size
-    stmt = prepare_query(db, "SELECT buffer FROM blocks WHERE entry = ? AND off >= ?");
-    sqlite3_bind_int64(stmt, 1, entry);
-    sqlite3_bind_int64(stmt, 2, size);
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        delete reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
-    }
-
-    stmt = prepare_query(db, "DELETE FROM blocks WHERE entry = ? AND off >= ?");
-    sqlite3_bind_int64(stmt, 1, entry);
-    sqlite3_bind_int64(stmt, 2, size);
-    sqlite3_step(stmt);
+    set_file_size(db, entry, size);
 
     return 0;
 }

@@ -28,4 +28,17 @@ public:
     ~scoped_lock() { mutex.unlock(); }
 };
 
+/*
+ * Data persistent in an open() and release() session
+ */
+
+struct file_session {
+    int64_t entry;
+    cl::CommandQueue queue;
+    // Set to true by write() so that read() knows to wait for OpenCL writes
+    bool dirty;
+
+    file_session(int64_t entry, cl::CommandQueue queue) : entry(entry), queue(queue), dirty(false) {}
+};
+
 #endif

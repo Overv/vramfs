@@ -68,9 +68,10 @@ static std::mutex fslock;
 // Connection to file system database
 static sqlite3* db;
 
-// OpenCL context
+// OpenCL context, GPU device and prototype queue to create others from
 static cl::Context* ocl_context;
-static cl::CommandQueue* ocl_queue;
+static cl::Device* ocl_device;
+static cl::CommandQueue* ocl_proto_queue;
 
 // Prepared statement cache
 static std::unordered_map<std::string, sqlite3_stmt*> prepared_statements;
@@ -131,14 +132,14 @@ static cl::Buffer* get_block(sqlite3* db, int64_t entry, off_t off) {
 }
 
 // Allocate new block, buf is only set on success (returning true)
-static bool create_block(sqlite3* db, int64_t entry, off_t off, cl::Buffer** buf) {
+static bool create_block(sqlite3* db, cl::CommandQueue& queue, int64_t entry, off_t off, cl::Buffer** buf) {
     int r;
 
     auto ocl_buf = new cl::Buffer(*ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
     if (r != CL_SUCCESS) return false;
 
     // Initialise with zeros
-    r = ocl_queue->enqueueFillBuffer(*ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
+    r = queue.enqueueFillBuffer(*ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
     if (r != CL_SUCCESS) return false;
 
     auto stmt = prepare_query(db, "INSERT INTO blocks (entry, off, buffer) VALUES (?, ?, ?)");
@@ -289,7 +290,8 @@ static void* vram_init(fuse_conn_info* conn) {
     if (gpu_devices.size() == 0) return fatal_error("no opencl capable gpu found", nullptr);
 
     ocl_context = new cl::Context(gpu_devices[0]);
-    ocl_queue = new cl::CommandQueue(*ocl_context, gpu_devices[0]);
+    ocl_device = new cl::Device(gpu_devices[0]);
+    ocl_proto_queue = new cl::CommandQueue(*ocl_context, *ocl_device);
 
     return db;
 }
@@ -432,7 +434,8 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     sqlite3_step(stmt);
 
     // Open it by assigning new file handle
-    fi->fh = sqlite3_last_insert_rowid(db);
+    entry = sqlite3_last_insert_rowid(db);
+    fi->fh = reinterpret_cast<uint64_t>(new file_session(entry, *ocl_proto_queue));
 
     return 0;
 }
@@ -556,7 +559,7 @@ static int vram_open(const char* path, fuse_file_info* fi) {
     int64_t entry = index_find(db, path, entry_filter::file);
 
     if (entry > 0) {
-        fi->fh = entry;
+        fi->fh = reinterpret_cast<uint64_t>(new file_session(entry, *ocl_proto_queue));
         return 0;
     } else {
         // Return entry find error if it wasn't found
@@ -570,10 +573,16 @@ static int vram_open(const char* path, fuse_file_info* fi) {
 
 static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
+    file_session* session = reinterpret_cast<file_session*>(fi->fh);
 
-    size_t file_size = get_file_size(db, fi->fh);
+    size_t file_size = get_file_size(db, session->entry);
     if ((size_t) off >= file_size) return 0;
     size = std::min(file_size - off, size);
+
+    if (session->dirty) {
+        session->queue.finish();
+        session->dirty = false;
+    }
 
     // Walk over blocks in read region
     off_t end_pos = off + size;
@@ -585,10 +594,10 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
         off_t block_off = off - block_start;
         size_t read_size = std::min(BLOCK_SIZE - block_off, size);
 
-        cl::Buffer* ocl_buf = get_block(db, fi->fh, block_start);
+        cl::Buffer* ocl_buf = get_block(db, session->entry, block_start);
 
         if (ocl_buf) {
-            ocl_queue->enqueueReadBuffer(*ocl_buf, true, block_off, read_size, buf, nullptr, nullptr);
+            session->queue.enqueueReadBuffer(*ocl_buf, true, block_off, read_size, buf, nullptr, nullptr);
         } else {
             // Non-written part of file
             memset(buf, 0, read_size);
@@ -606,8 +615,13 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
  * Write file
  */
 
+static CL_CALLBACK void write_cb(cl_event ev, cl_int status, void* buf_copy) {
+    delete [] reinterpret_cast<char*>(buf_copy);
+}
+
 static int vram_write(const char* path, const char* buf, size_t size, off_t off, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
+    file_session* session = reinterpret_cast<file_session*>(fi->fh);
 
     // Walk over blocks in write region
     off_t end_pos = off + size;
@@ -619,31 +633,69 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
         off_t block_off = off - block_start;
         size_t write_size = std::min(BLOCK_SIZE - block_off, size);
 
-        cl::Buffer* ocl_buf = get_block(db, fi->fh, block_start);
+        cl::Buffer* ocl_buf = get_block(db, session->entry, block_start);
 
         if (!ocl_buf) {
-            bool r = create_block(db, fi->fh, block_start, &ocl_buf);
+            bool r = create_block(db, session->queue, session->entry, block_start, &ocl_buf);
 
             // Failed to allocate buffer, likely out of VRAM
             if (!r) break;
         }
 
-        ocl_queue->enqueueWriteBuffer(*ocl_buf, true, block_off, write_size, buf, nullptr, nullptr);
+        // Make copy of buffer for OpenCL to do asynchronous write
+        char* buf_copy = new char[write_size];
+        memcpy(buf_copy, buf, write_size);
+
+        cl::Event event;
+        session->queue.enqueueWriteBuffer(*ocl_buf, false, block_off, write_size, buf_copy, nullptr, &event);
+
+        // Callback on completion to clean up the buffer copy
+        event.setCallback(CL_COMPLETE, write_cb, buf_copy);
 
         buf += write_size;
         off += write_size;
         size -= write_size;
     }
 
-    if (get_file_size(db, fi->fh) < (size_t) off) {
-        set_file_size(db, fi->fh, off);
+    if (get_file_size(db, session->entry) < (size_t) off) {
+        set_file_size(db, session->entry, off);
     }
+
+    session->dirty = true;
 
     if (off < end_pos) {
         return -ENOSPC;
     } else {
         return total_write;
     }
+}
+
+/*
+ * Sync writes to file
+ */
+
+static int vram_fsync(const char* path, int, fuse_file_info* fi) {
+    scoped_lock local_lock(fslock);
+    file_session* session = reinterpret_cast<file_session*>(fi->fh);
+
+    session->queue.finish();
+
+    return 0;
+}
+
+/*
+ * Close file
+ */
+
+static int vram_release(const char* path, fuse_file_info* fi) {
+    scoped_lock local_lock(fslock);
+    file_session* session = reinterpret_cast<file_session*>(fi->fh);
+
+    session->queue.finish();
+
+    delete session;
+
+    return 0;
 }
 
 /*
@@ -673,8 +725,9 @@ static void vram_destroy(void* userdata) {
         delete reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
     }
 
-    // Clean up OpenCL context
-    delete ocl_queue;
+    // Clean up the rest of OpenCL
+    delete ocl_proto_queue;
+    delete ocl_device;
     delete ocl_context;
 
     // Clean up prepared statements
@@ -705,6 +758,8 @@ static struct vram_operations : fuse_operations {
         open = vram_open;
         read = vram_read;
         write = vram_write;
+        fsync = vram_fsync;
+        release = vram_release;
         truncate = vram_truncate;
         destroy = vram_destroy;
     }

@@ -8,9 +8,17 @@
 #include <vector>
 #include <cstring>
 
+#define CL_CALLBACK
+
 const int CL_MEM_READ_WRITE = 0;
 const int CL_SUCCESS = 0;
 const int CL_DEVICE_TYPE_GPU = 0;
+const int CL_COMPLETE = 0;
+
+typedef int cl_event;
+typedef int cl_int;
+
+typedef CL_CALLBACK void (*callback_fn)(cl_event, cl_int, void*);
 
 namespace cl {
     class Device {
@@ -69,6 +77,17 @@ namespace cl {
         int enqueueWriteBuffer(Buffer& buf, bool block, int off, int size, const char* in, void* events, void* event) {
             memcpy(&buf.data[off], in, size);
             return CL_SUCCESS;
+        }
+
+        int finish() {
+            return CL_SUCCESS;
+        }
+    };
+
+    class Event {
+    public:
+        void setCallback(int flag, callback_fn cb, void* userdata) {
+            cb(0, 0, userdata);
         }
     };
 }

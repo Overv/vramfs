@@ -596,12 +596,15 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
 
         cl::Buffer* ocl_buf = get_block(db, session->entry, block_start);
 
+        // Allow multiple threads to block for reading simultaneously
+        fslock.unlock();
         if (ocl_buf) {
             session->queue.enqueueReadBuffer(*ocl_buf, true, block_off, read_size, buf, nullptr, nullptr);
         } else {
             // Non-written part of file
             memset(buf, 0, read_size);
         }
+        fslock.lock();
 
         buf += read_size;
         off += read_size;

@@ -6,20 +6,17 @@
 #include <sqlite3.h>
 
 /*
- * Desired result from index search functions
- *
- * These values are not bitflags, because that makes the logic for determining
- * the appropriate error code in case the type is different more complex.
+ * Types of objects in the file system, can be combined for index_find filter
  */
 
-namespace entry_filter {
-    enum entry_filter_t {
-        file,
-        directory,
-        link,
-        all,
-        nonlink
+namespace entry_type {
+    enum entry_type_t {
+        file = 1,
+        dir = 2,
+        link = 4
     };
+
+    const int all = file | dir | link;
 }
 
 /*

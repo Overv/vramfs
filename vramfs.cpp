@@ -187,15 +187,6 @@ static int delete_file(sqlite3* db, int64_t entry) {
     return 0;
 }
 
-// Delete a link entry
-static int delete_link(sqlite3* db, int64_t entry) {
-    auto stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
-    sqlite3_bind_int64(stmt, 1, entry);
-    sqlite3_step(stmt);
-
-    return 0;
-}
-
 static size_t get_file_size(sqlite3* db, int64_t entry) {
     auto stmt = prepare_query(db, "SELECT size FROM entries WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, entry);
@@ -215,7 +206,10 @@ static void set_file_size(sqlite3* db, int64_t entry, size_t size) {
 }
 
 // Find entry by path (starting with /)
-static int64_t index_find(sqlite3* db, const char* path, entry_filter::entry_filter_t filter = entry_filter::all) {
+static int64_t index_find(sqlite3* db, const char* path, int filter = entry_type::all) {
+    // If filter is empty, no entry will ever match
+    if ((filter & entry_type::all) == 0) return -ENOENT;
+
     // Prepare entry lookup query
     auto stmt = prepare_query(db, "SELECT id, dir, target FROM entries WHERE parent = ? AND name = ? LIMIT 1");
     if (!stmt) return fatal_error("failed to query entry", -EAGAIN);
@@ -231,8 +225,7 @@ static int64_t index_find(sqlite3* db, const char* path, entry_filter::entry_fil
     while (getline(stream, part, '/')) {
         // If current directory is actually a file, abort
         if (!dir) {
-            entry = -ENOTDIR;
-            break;
+            return -ENOTDIR;
         }
 
         // Look up corresponding entry in the current directory
@@ -242,8 +235,7 @@ static int64_t index_find(sqlite3* db, const char* path, entry_filter::entry_fil
 
         // If entry was not found, abort
         if (r != SQLITE_ROW) {
-            entry = -ENOENT;
-            break;
+            return -ENOENT;
         }
 
         // Continue with entry as new current directory (if not end of path)
@@ -259,21 +251,25 @@ static int64_t index_find(sqlite3* db, const char* path, entry_filter::entry_fil
     // If the path is empty, assume the root directory
     if (!path[0]) entry = ROOT_ENTRY;
 
-    // If an undesired type of entry was found, return an error
+    // If an undesired type of entry was found, return an appropriate error
     if (entry > 0) {
-        bool link = target.size() > 0;
+        int actual_type = target.size() > 0 ? entry_type::link :
+                          dir ? entry_type::dir :
+                          entry_type::file;
 
-        // If caller operates on non-link, operation is not permitted
-        if (link && filter != entry_filter::all && filter != entry_filter::link) {
-            entry = -EPERM;
-        } else if (filter == entry_filter::file && dir) {
-            entry = -EISDIR;
-        } else if (filter == entry_filter::directory && !dir) {
-            entry = -ENOTDIR;
+        if (!(actual_type & filter)) {
+            if (actual_type == entry_type::file) {
+                if (filter & entry_type::link) return -ENOENT;
+                if (filter & entry_type::dir) return -EISDIR;
+            } else if (actual_type == entry_type::dir) {
+                if (filter & entry_type::file) return -ENOTDIR;
+                if (filter & entry_type::link) return -EPERM;
+            } else {
+                return -EPERM;
+            }
         }
     }
 
-    // Return final entry or error
     return entry;
 }
 
@@ -371,7 +367,7 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
 static int vram_readlink(const char* path, char* buf, size_t size) {
     scoped_lock local_lock(fslock);
 
-    int64_t entry = index_find(db, path, entry_filter::link);
+    int64_t entry = index_find(db, path, entry_type::link);
     if (entry < 0) return entry;
 
     auto stmt = prepare_query(db, "SELECT target FROM entries WHERE id = ?");
@@ -392,7 +388,7 @@ static int vram_chmod(const char* path, mode_t mode) {
     scoped_lock local_lock(fslock);
 
     // Look up entry
-    int64_t entry = index_find(db, path, entry_filter::nonlink);
+    int64_t entry = index_find(db, path, entry_type::file | entry_type::dir);
     if (entry < 0) return entry;
 
     // Update mode
@@ -412,7 +408,7 @@ static int vram_utimens(const char* path, const timespec tv[2]) {
     scoped_lock local_lock(fslock);
 
     // Look up entry
-    int64_t entry = index_find(db, path, entry_filter::nonlink);
+    int64_t entry = index_find(db, path, entry_type::file | entry_type::dir);
     if (entry < 0) return entry;
 
     // Update times (ignore nanosecond part)
@@ -433,7 +429,7 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
     scoped_lock local_lock(fslock);
 
     // Look up directory
-    int64_t entry = index_find(db, path, entry_filter::directory);
+    int64_t entry = index_find(db, path, entry_type::dir);
 
     if (entry > 0) {
         // List directory contents
@@ -472,7 +468,7 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     split_file_path(path, dir, file);
 
     // Check if directory exists
-    entry = index_find(db, dir.c_str(), entry_filter::directory);
+    entry = index_find(db, dir.c_str(), entry_type::dir);
     if (entry < 0) return entry;
 
     // Create new file
@@ -505,7 +501,7 @@ static int vram_mkdir(const char* path, mode_t) {
     split_file_path(path, parent, dir);
 
     // Check if parent directory exists
-    entry = index_find(db, parent.c_str(), entry_filter::directory);
+    entry = index_find(db, parent.c_str(), entry_type::dir);
     if (entry < 0) return entry;
 
     // Create new directory
@@ -534,7 +530,7 @@ static int vram_symlink(const char* target, const char* path) {
     split_file_path(path, parent, name);
 
     // Check if parent directory exists
-    entry = index_find(db, parent.c_str(), entry_filter::directory);
+    entry = index_find(db, parent.c_str(), entry_type::dir);
     if (entry < 0) return entry;
 
     // Create new symlink - target is only resolved at usage
@@ -558,17 +554,11 @@ static int vram_symlink(const char* target, const char* path) {
 static int vram_unlink(const char* path) {
     scoped_lock local_lock(fslock);
 
-    // First see if it's a symlink
-    int64_t entry = index_find(db, path, entry_filter::link);
+    int64_t entry = index_find(db, path, entry_type::link | entry_type::file);
+    if (entry < 0) return entry;
 
-    if (entry >= 0) {
-        delete_link(db, entry);
-    } else {
-        // Otherwise try to delete it as file
-        entry = index_find(db, path, entry_filter::file);
-        if (entry < 0) return entry;
-        delete_file(db, entry);
-    }
+    // Also works for links
+    delete_file(db, entry);
 
     return 0;
 }
@@ -581,7 +571,7 @@ static int vram_rmdir(const char* path) {
     scoped_lock local_lock(fslock);
 
     // Fail if entry doesn't exist or is a file
-    int64_t entry = index_find(db, path, entry_filter::directory);
+    int64_t entry = index_find(db, path, entry_type::dir);
     if (entry < 0) return entry;
 
     // Check if directory is empty
@@ -616,7 +606,7 @@ static int vram_rename(const char* path, const char* new_path) {
     std::string dir, new_name;
     split_file_path(new_path, dir, new_name);
 
-    int64_t parent = index_find(db, dir.c_str(), entry_filter::directory);
+    int64_t parent = index_find(db, dir.c_str(), entry_type::dir);
     if (parent < 0) return parent;
 
     // If the destination entry already exists, then delete it
@@ -641,7 +631,7 @@ static int vram_open(const char* path, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
 
     // Look up file
-    int64_t entry = index_find(db, path, entry_filter::file);
+    int64_t entry = index_find(db, path, entry_type::file);
 
     if (entry > 0) {
         fi->fh = reinterpret_cast<uint64_t>(new file_session(entry, *ocl_proto_queue));
@@ -793,7 +783,7 @@ static int vram_release(const char* path, fuse_file_info* fi) {
 static int vram_truncate(const char* path, off_t size) {
     scoped_lock local_lock(fslock);
 
-    int64_t entry = index_find(db, path, entry_filter::file);
+    int64_t entry = index_find(db, path, entry_type::file);
     if (entry < 0) return entry;
 
     set_file_size(db, entry, size);

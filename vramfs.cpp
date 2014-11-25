@@ -36,7 +36,9 @@ static const char* entries_table_sql =
         // Numeric version of CURRENT_TIMESTAMP
         "atime INTEGER DEFAULT (STRFTIME('%s'))," \
         "mtime INTEGER DEFAULT (STRFTIME('%s'))," \
-        "ctime INTEGER DEFAULT (STRFTIME('%s'))" \
+        "ctime INTEGER DEFAULT (STRFTIME('%s'))," \
+        // Target if this entry is a symlink
+        "target TEXT" \
     ")";
 
 static const char* blocks_table_sql =
@@ -88,6 +90,11 @@ static T fatal_error(const char* error, T ret) {
     return ret;
 }
 
+// Create prepared statement, automatically caches the compiled results
+//
+// This does have the side-effect of making any statement returned from this not
+// thread safe. Solving that would require having multiple cached copies of
+// statements and keeping track of usage.
 static sqlite3_stmt* prepare_query(sqlite3* db, const char* query) {
     auto it = prepared_statements.find(query);
     sqlite3_stmt* stmt = nullptr;
@@ -180,6 +187,15 @@ static int delete_file(sqlite3* db, int64_t entry) {
     return 0;
 }
 
+// Delete a link entry
+static int delete_link(sqlite3* db, int64_t entry) {
+    auto stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_step(stmt);
+
+    return 0;
+}
+
 static size_t get_file_size(sqlite3* db, int64_t entry) {
     auto stmt = prepare_query(db, "SELECT size FROM entries WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, entry);
@@ -201,12 +217,13 @@ static void set_file_size(sqlite3* db, int64_t entry, size_t size) {
 // Find entry by path (starting with /)
 static int64_t index_find(sqlite3* db, const char* path, entry_filter::entry_filter_t filter = entry_filter::all) {
     // Prepare entry lookup query
-    auto stmt = prepare_query(db, "SELECT id, dir FROM entries WHERE parent = ? AND name = ? LIMIT 1");
+    auto stmt = prepare_query(db, "SELECT id, dir, target FROM entries WHERE parent = ? AND name = ? LIMIT 1");
     if (!stmt) return fatal_error("failed to query entry", -EAGAIN);
 
     // Traverse file system by hierarchically, starting from root directory
     int64_t entry = ROOT_PARENT;
     bool dir = true;
+    std::string target;
 
     std::stringstream stream(path);
     std::string part;
@@ -233,6 +250,9 @@ static int64_t index_find(sqlite3* db, const char* path, entry_filter::entry_fil
         entry = sqlite3_column_int64(stmt, 0);
         dir = sqlite3_column_int(stmt, 1);
 
+        const char* target_c = (const char*) sqlite3_column_text(stmt, 2);
+        target = target_c ? target_c : "";
+
         sqlite3_reset(stmt);
     }
 
@@ -241,10 +261,15 @@ static int64_t index_find(sqlite3* db, const char* path, entry_filter::entry_fil
 
     // If an undesired type of entry was found, return an error
     if (entry > 0) {
-        if (filter == entry_filter::directory && !dir) {
-            entry = -ENOTDIR;
+        bool link = target.size() > 0;
+
+        // If caller operates on non-link, operation is not permitted
+        if (link && filter != entry_filter::all && filter != entry_filter::link) {
+            entry = -EPERM;
         } else if (filter == entry_filter::file && dir) {
             entry = -EISDIR;
+        } else if (filter == entry_filter::directory && !dir) {
+            entry = -ENOTDIR;
         }
     }
 
@@ -308,7 +333,7 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
     if (entry < 0) return entry;
 
     // Load all info about the entry
-    auto stmt = prepare_query(db, "SELECT dir, mode, size, atime, mtime, ctime FROM entries WHERE id = ?");
+    auto stmt = prepare_query(db, "SELECT dir, mode, target, size, atime, mtime, ctime FROM entries WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_step(stmt);
 
@@ -316,21 +341,45 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
 
     bool dir = sqlite3_column_int(stmt, 0);
     int mode = sqlite3_column_int(stmt, 1);
+    const char* target = (const char*) sqlite3_column_text(stmt, 2);
 
     if (dir) {
         stbuf->st_mode = S_IFDIR | mode;
         stbuf->st_nlink = 2;
-    } else {
+    } else if (target == nullptr) {
         stbuf->st_mode = S_IFREG | mode;
+        stbuf->st_nlink = 1;
+    } else {
+        stbuf->st_mode = S_IFLNK | 0777;
         stbuf->st_nlink = 1;
     }
 
     stbuf->st_uid = geteuid();
     stbuf->st_gid = getegid();
-    stbuf->st_size = sqlite3_column_int64(stmt, 2);
-    stbuf->st_atime = sqlite3_column_int64(stmt, 3);
-    stbuf->st_mtime = sqlite3_column_int64(stmt, 4);
-    stbuf->st_ctime = sqlite3_column_int64(stmt, 5);
+    stbuf->st_size = sqlite3_column_int64(stmt, 3);
+    stbuf->st_atime = sqlite3_column_int64(stmt, 4);
+    stbuf->st_mtime = sqlite3_column_int64(stmt, 5);
+    stbuf->st_ctime = sqlite3_column_int64(stmt, 6);
+
+    return 0;
+}
+
+/*
+ * Get target of link
+ */
+
+static int vram_readlink(const char* path, char* buf, size_t size) {
+    scoped_lock local_lock(fslock);
+
+    int64_t entry = index_find(db, path, entry_filter::link);
+    if (entry < 0) return entry;
+
+    auto stmt = prepare_query(db, "SELECT target FROM entries WHERE id = ?");
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_step(stmt);
+
+    const char* target = (const char*) sqlite3_column_text(stmt, 0);
+    strncpy(buf, target, size);
 
     return 0;
 }
@@ -343,7 +392,7 @@ static int vram_chmod(const char* path, mode_t mode) {
     scoped_lock local_lock(fslock);
 
     // Look up entry
-    int64_t entry = index_find(db, path);
+    int64_t entry = index_find(db, path, entry_filter::nonlink);
     if (entry < 0) return entry;
 
     // Update mode
@@ -363,7 +412,7 @@ static int vram_utimens(const char* path, const timespec tv[2]) {
     scoped_lock local_lock(fslock);
 
     // Look up entry
-    int64_t entry = index_find(db, path);
+    int64_t entry = index_find(db, path, entry_filter::nonlink);
     if (entry < 0) return entry;
 
     // Update times (ignore nanosecond part)
@@ -414,7 +463,7 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
 static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
 
-    // Fail if file already exists
+    // Fail if entry already exists
     int64_t entry = index_find(db, path);
     if (entry > 0) return -EEXIST;
 
@@ -447,7 +496,7 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
 static int vram_mkdir(const char* path, mode_t) {
     scoped_lock local_lock(fslock);
 
-    // Fail if directory already exists
+    // Fail if entry with that name already exists
     int64_t entry = index_find(db, path);
     if (entry > 0) return -EEXIST;
 
@@ -470,6 +519,36 @@ static int vram_mkdir(const char* path, mode_t) {
 }
 
 /*
+ * Create symlink
+ */
+
+static int vram_symlink(const char* target, const char* path) {
+    scoped_lock local_lock(fslock);
+
+    // Fail if an entry with that name already exists
+    int64_t entry = index_find(db, path);
+    if (entry > 0) return -EEXIST;
+
+    // Split path in parent directory and new symlink name
+    std::string parent, name;
+    split_file_path(path, parent, name);
+
+    // Check if parent directory exists
+    entry = index_find(db, parent.c_str(), entry_filter::directory);
+    if (entry < 0) return entry;
+
+    // Create new symlink - target is only resolved at usage
+    auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, target, size) VALUES (?, ?, ?, ?)");
+    sqlite3_bind_int64(stmt, 1, entry);
+    sqlite3_bind_text(stmt, 2, name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, target, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 4, strlen(target));
+    sqlite3_step(stmt);
+
+    return 0;
+}
+
+/*
  * Delete file
  *
  * NOTE: FUSE will only call this function once the last handle to a file has
@@ -479,11 +558,17 @@ static int vram_mkdir(const char* path, mode_t) {
 static int vram_unlink(const char* path) {
     scoped_lock local_lock(fslock);
 
-    // Fail if entry doesn't exist or is a directory
-    int64_t entry = index_find(db, path, entry_filter::file);
-    if (entry < 0) return entry;
+    // First see if it's a symlink
+    int64_t entry = index_find(db, path, entry_filter::link);
 
-    delete_file(db, entry);
+    if (entry >= 0) {
+        delete_link(db, entry);
+    } else {
+        // Otherwise try to delete it as file
+        entry = index_find(db, path, entry_filter::file);
+        if (entry < 0) return entry;
+        delete_file(db, entry);
+    }
 
     return 0;
 }
@@ -534,7 +619,7 @@ static int vram_rename(const char* path, const char* new_path) {
     int64_t parent = index_find(db, dir.c_str(), entry_filter::directory);
     if (parent < 0) return parent;
 
-    // If the destination file already exists, then delete it
+    // If the destination entry already exists, then delete it
     int64_t dest_entry = index_find(db, new_path);
     if (dest_entry >= 0) delete_file(db, dest_entry);
 
@@ -708,7 +793,7 @@ static int vram_release(const char* path, fuse_file_info* fi) {
 static int vram_truncate(const char* path, off_t size) {
     scoped_lock local_lock(fslock);
 
-    int64_t entry = index_find(db, path);
+    int64_t entry = index_find(db, path, entry_filter::file);
     if (entry < 0) return entry;
 
     set_file_size(db, entry, size);
@@ -750,11 +835,13 @@ static struct vram_operations : fuse_operations {
     vram_operations() {
         init = vram_init;
         getattr = vram_getattr;
+        readlink = vram_readlink;
         utimens = vram_utimens;
         chmod = vram_chmod;
         readdir = vram_readdir;
         create = vram_create;
         mkdir = vram_mkdir;
+        symlink = vram_symlink;
         unlink = vram_unlink;
         rmdir = vram_rmdir;
         rename = vram_rename;

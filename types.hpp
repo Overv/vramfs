@@ -7,13 +7,18 @@
 
 /*
  * Desired result from index search functions
+ *
+ * These values are not bitflags, because that makes the logic for determining
+ * the appropriate error code in case the type is different more complex.
  */
 
 namespace entry_filter {
     enum entry_filter_t {
         file,
         directory,
-        all
+        link,
+        all,
+        nonlink
     };
 }
 

@@ -39,6 +39,9 @@ struct file_session {
     cl::CommandQueue queue;
     // Set to true by write() so that read() knows to wait for OpenCL writes
     bool dirty;
+    // Set to true when read() / write() are called to update file times
+    bool read = false;
+    bool write = false;
 
     file_session(int64_t entry, cl::CommandQueue queue) : entry(entry), queue(queue), dirty(false) {}
 };

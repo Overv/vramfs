@@ -33,10 +33,13 @@ static const char* entries_table_sql =
         "mode INTEGER DEFAULT 0," \
         // Default size for directories
         "size INTEGER DEFAULT 4096," \
-        // Numeric version of CURRENT_TIMESTAMP
-        "atime INTEGER DEFAULT (STRFTIME('%s'))," \
-        "mtime INTEGER DEFAULT (STRFTIME('%s'))," \
-        "ctime INTEGER DEFAULT (STRFTIME('%s'))," \
+        // SQLite doesn't have nanosecond time, so no sensible default
+        "atime_sec INTEGER DEFAULT 0," \
+        "atime_nsec INTEGER DEFAULT 0," \
+        "mtime_sec INTEGER DEFAULT 0," \
+        "mtime_nsec INTEGER DEFAULT 0," \
+        "ctime_sec INTEGER DEFAULT 0," \
+        "ctime_nsec INTEGER DEFAULT 0," \
         // Target if this entry is a symlink
         "target TEXT" \
     ")";
@@ -90,12 +93,19 @@ static T fatal_error(const char* error, T ret) {
     return ret;
 }
 
+// Get current time with nanosecond precision
+static timespec get_time() {
+    timespec tv;
+    clock_gettime(CLOCK_REALTIME, &tv);
+    return tv;
+}
+
 // Create prepared statement, automatically caches the compiled results
 //
 // This does have the side-effect of making any statement returned from this not
 // thread safe. Solving that would require having multiple cached copies of
 // statements and keeping track of usage.
-static sqlite3_stmt* prepare_query(sqlite3* db, const char* query) {
+static sqlite3_stmt* prepare_query(const char* query) {
     auto it = prepared_statements.find(query);
     sqlite3_stmt* stmt = nullptr;
 
@@ -126,8 +136,8 @@ static void split_file_path(const std::string& path, std::string& dir, std::stri
 
 // Get the OpenCL buffer of the block starting at *off* or nullptr if the block
 // hasn't been written yet
-static cl::Buffer* get_block(sqlite3* db, int64_t entry, off_t off) {
-    auto stmt = prepare_query(db, "SELECT buffer FROM blocks WHERE entry = ? AND off = ?");
+static cl::Buffer* get_block(int64_t entry, off_t off) {
+    auto stmt = prepare_query("SELECT buffer FROM blocks WHERE entry = ? AND off = ?");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_bind_int64(stmt, 2, off);
 
@@ -139,7 +149,7 @@ static cl::Buffer* get_block(sqlite3* db, int64_t entry, off_t off) {
 }
 
 // Allocate new block, buf is only set on success (returning true)
-static bool create_block(sqlite3* db, cl::CommandQueue& queue, int64_t entry, off_t off, cl::Buffer** buf) {
+static bool create_block(cl::CommandQueue& queue, int64_t entry, off_t off, cl::Buffer** buf) {
     int r;
 
     auto ocl_buf = new cl::Buffer(*ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
@@ -149,7 +159,7 @@ static bool create_block(sqlite3* db, cl::CommandQueue& queue, int64_t entry, of
     r = queue.enqueueFillBuffer(*ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
     if (r != CL_SUCCESS) return false;
 
-    auto stmt = prepare_query(db, "INSERT INTO blocks (entry, off, buffer) VALUES (?, ?, ?)");
+    auto stmt = prepare_query("INSERT INTO blocks (entry, off, buffer) VALUES (?, ?, ?)");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_bind_int64(stmt, 2, off);
     sqlite3_bind_int64(stmt, 3, reinterpret_cast<int64_t>(ocl_buf));
@@ -161,8 +171,8 @@ static bool create_block(sqlite3* db, cl::CommandQueue& queue, int64_t entry, of
 }
 
 // Delete all blocks with a starting offset >= *off*
-static void delete_blocks(sqlite3* db, int64_t entry, off_t off = 0) {
-    auto stmt = prepare_query(db, "SELECT buffer FROM blocks WHERE entry = ? AND off >= ?");
+static void delete_blocks(int64_t entry, off_t off = 0) {
+    auto stmt = prepare_query("SELECT buffer FROM blocks WHERE entry = ? AND off >= ?");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_bind_int64(stmt, 2, off);
 
@@ -170,25 +180,25 @@ static void delete_blocks(sqlite3* db, int64_t entry, off_t off = 0) {
         delete reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
     }
 
-    stmt = prepare_query(db, "DELETE FROM blocks WHERE entry = ? AND off >= ?");
+    stmt = prepare_query("DELETE FROM blocks WHERE entry = ? AND off >= ?");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_bind_int64(stmt, 2, off);
     sqlite3_step(stmt);
 }
 
 // Delete a file entry and its blocks
-static int delete_file(sqlite3* db, int64_t entry) {
-    auto stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
+static int delete_file(int64_t entry) {
+    auto stmt = prepare_query("DELETE FROM entries WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_step(stmt);
 
-    delete_blocks(db, entry);
+    delete_blocks(entry);
 
     return 0;
 }
 
-static size_t get_file_size(sqlite3* db, int64_t entry) {
-    auto stmt = prepare_query(db, "SELECT size FROM entries WHERE id = ?");
+static size_t get_file_size(int64_t entry) {
+    auto stmt = prepare_query("SELECT size FROM entries WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_step(stmt);
 
@@ -196,22 +206,49 @@ static size_t get_file_size(sqlite3* db, int64_t entry) {
 }
 
 // Change file size, any blocks beyond the size will be automatically removed
-static void set_file_size(sqlite3* db, int64_t entry, size_t size) {
-    auto stmt = prepare_query(db, "UPDATE entries SET size = ? WHERE id = ?");
+static void set_file_size(int64_t entry, size_t size) {
+    auto stmt = prepare_query("UPDATE entries SET size = ? WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, size);
     sqlite3_bind_int64(stmt, 2, entry);
     sqlite3_step(stmt);
 
-    delete_blocks(db, entry, size);
+    delete_blocks(entry, size);
+}
+
+// Set access time of entry
+static void set_entry_atime(int64_t entry, timespec time) {
+    auto stmt = prepare_query("UPDATE entries SET atime_sec = ?, atime_nsec = ? WHERE id = ?");
+    sqlite3_bind_int64(stmt, 1, time.tv_sec);
+    sqlite3_bind_int64(stmt, 2, time.tv_sec);
+    sqlite3_bind_int64(stmt, 3, entry);
+    sqlite3_step(stmt);
+}
+
+// Set last modified time of entry (contents)
+static void set_entry_mtime(int64_t entry, timespec time) {
+    auto stmt = prepare_query("UPDATE entries SET mtime_sec = ?, mtime_nsec = ? WHERE id = ?");
+    sqlite3_bind_int64(stmt, 1, time.tv_sec);
+    sqlite3_bind_int64(stmt, 2, time.tv_sec);
+    sqlite3_bind_int64(stmt, 3, entry);
+    sqlite3_step(stmt);
+}
+
+// Set change time of entry (metadata)
+static void set_entry_ctime(int64_t entry, timespec time) {
+    auto stmt = prepare_query("UPDATE entries SET ctime_sec = ?, ctime_nsec = ? WHERE id = ?");
+    sqlite3_bind_int64(stmt, 1, time.tv_sec);
+    sqlite3_bind_int64(stmt, 2, time.tv_sec);
+    sqlite3_bind_int64(stmt, 3, entry);
+    sqlite3_step(stmt);
 }
 
 // Find entry by path (starting with /)
-static int64_t index_find(sqlite3* db, const char* path, int filter = entry_type::all) {
+static int64_t index_find(const char* path, int filter = entry_type::all) {
     // If filter is empty, no entry will ever match
     if ((filter & entry_type::all) == 0) return -ENOENT;
 
     // Prepare entry lookup query
-    auto stmt = prepare_query(db, "SELECT id, dir, target FROM entries WHERE parent = ? AND name = ? LIMIT 1");
+    auto stmt = prepare_query("SELECT id, dir, target FROM entries WHERE parent = ? AND name = ? LIMIT 1");
     if (!stmt) return fatal_error("failed to query entry", -EAGAIN);
 
     // Traverse file system by hierarchically, starting from root directory
@@ -325,11 +362,14 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
     scoped_lock local_lock(fslock);
 
     // Look up entry
-    int64_t entry = index_find(db, path);
+    int64_t entry = index_find(path);
     if (entry < 0) return entry;
 
     // Load all info about the entry
-    auto stmt = prepare_query(db, "SELECT dir, mode, target, size, atime, mtime, ctime FROM entries WHERE id = ?");
+    auto stmt = prepare_query(
+            "SELECT dir, mode, target, size, atime_sec, atime_nsec, mtime_sec," \
+            "mtime_nsec, ctime_sec, ctime_nsec FROM entries WHERE id = ?");
+
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_step(stmt);
 
@@ -353,9 +393,9 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
     stbuf->st_uid = geteuid();
     stbuf->st_gid = getegid();
     stbuf->st_size = sqlite3_column_int64(stmt, 3);
-    stbuf->st_atime = sqlite3_column_int64(stmt, 4);
-    stbuf->st_mtime = sqlite3_column_int64(stmt, 5);
-    stbuf->st_ctime = sqlite3_column_int64(stmt, 6);
+    stbuf->st_atim = {sqlite3_column_int64(stmt, 4), sqlite3_column_int64(stmt, 5)};
+    stbuf->st_mtim = {sqlite3_column_int64(stmt, 6), sqlite3_column_int64(stmt, 7)};
+    stbuf->st_ctim = {sqlite3_column_int64(stmt, 8), sqlite3_column_int64(stmt, 9)};
 
     return 0;
 }
@@ -367,10 +407,10 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
 static int vram_readlink(const char* path, char* buf, size_t size) {
     scoped_lock local_lock(fslock);
 
-    int64_t entry = index_find(db, path, entry_type::link);
+    int64_t entry = index_find(path, entry_type::link);
     if (entry < 0) return entry;
 
-    auto stmt = prepare_query(db, "SELECT target FROM entries WHERE id = ?");
+    auto stmt = prepare_query("SELECT target FROM entries WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_step(stmt);
 
@@ -388,14 +428,16 @@ static int vram_chmod(const char* path, mode_t mode) {
     scoped_lock local_lock(fslock);
 
     // Look up entry
-    int64_t entry = index_find(db, path, entry_type::file | entry_type::dir);
+    int64_t entry = index_find(path, entry_type::file | entry_type::dir);
     if (entry < 0) return entry;
 
     // Update mode
-    auto stmt = prepare_query(db, "UPDATE entries SET mode = ? WHERE id = ?");
+    auto stmt = prepare_query("UPDATE entries SET mode = ? WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, mode);
     sqlite3_bind_int64(stmt, 2, entry);
     sqlite3_step(stmt);
+
+    set_entry_ctime(entry, get_time());
 
     return 0;
 }
@@ -408,14 +450,23 @@ static int vram_utimens(const char* path, const timespec tv[2]) {
     scoped_lock local_lock(fslock);
 
     // Look up entry
-    int64_t entry = index_find(db, path, entry_type::file | entry_type::dir);
+    int64_t entry = index_find(path, entry_type::file | entry_type::dir);
     if (entry < 0) return entry;
 
-    // Update times (ignore nanosecond part)
-    auto stmt = prepare_query(db, "UPDATE entries SET atime = ?, mtime = ?, ctime = STRFTIME('%s') WHERE id = ?");
+    // Update times
+    auto stmt = prepare_query(
+            "UPDATE entries SET atime_sec = ?, atime_nsec = ?, mtime_sec = ?," \
+            "mtime_nsec = ?, ctime_sec = ?, ctime_nsec = ? WHERE id = ?");
+
+    timespec tv_now = get_time();
+
     sqlite3_bind_int64(stmt, 1, tv[0].tv_sec);
-    sqlite3_bind_int64(stmt, 2, tv[1].tv_sec);
-    sqlite3_bind_int64(stmt, 3, entry);
+    sqlite3_bind_int64(stmt, 2, tv[0].tv_nsec);
+    sqlite3_bind_int64(stmt, 3, tv[1].tv_sec);
+    sqlite3_bind_int64(stmt, 4, tv[1].tv_nsec);
+    sqlite3_bind_int64(stmt, 5, tv_now.tv_sec);
+    sqlite3_bind_int64(stmt, 6, tv_now.tv_nsec);
+    sqlite3_bind_int64(stmt, 7, entry);
     sqlite3_step(stmt);
 
     return 0;
@@ -429,11 +480,11 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
     scoped_lock local_lock(fslock);
 
     // Look up directory
-    int64_t entry = index_find(db, path, entry_type::dir);
+    int64_t entry = index_find(path, entry_type::dir);
 
     if (entry > 0) {
         // List directory contents
-        auto stmt = prepare_query(db, "SELECT name FROM entries WHERE parent = ?");
+        auto stmt = prepare_query("SELECT name FROM entries WHERE parent = ?");
         sqlite3_bind_int64(stmt, 1, entry);
 
         // Required default entries
@@ -460,7 +511,7 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
 
     // Fail if entry already exists
-    int64_t entry = index_find(db, path);
+    int64_t entry = index_find(path);
     if (entry > 0) return -EEXIST;
 
     // Split path in directory and file name parts
@@ -468,14 +519,28 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     split_file_path(path, dir, file);
 
     // Check if directory exists
-    entry = index_find(db, dir.c_str(), entry_type::dir);
+    entry = index_find(dir.c_str(), entry_type::dir);
     if (entry < 0) return entry;
 
     // Create new file
-    auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, mode, size) VALUES (?, ?, ?, 0)");
+    auto stmt = prepare_query(
+            "INSERT INTO entries (parent, name, mode, size, atime_sec," \
+            "atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec) VALUES" \
+            "(?, ?, ?, 0, ?, ?, ?, ?, ?, ?)");
+
+    timespec tv_now = get_time();
+
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_bind_text(stmt, 2, file.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 3, DEFAULT_FILE_MODE);
+
+    sqlite3_bind_int64(stmt, 4, tv_now.tv_sec);
+    sqlite3_bind_int64(stmt, 5, tv_now.tv_nsec);
+    sqlite3_bind_int64(stmt, 6, tv_now.tv_sec);
+    sqlite3_bind_int64(stmt, 7, tv_now.tv_nsec);
+    sqlite3_bind_int64(stmt, 8, tv_now.tv_sec);
+    sqlite3_bind_int64(stmt, 9, tv_now.tv_nsec);
+
     sqlite3_step(stmt);
 
     // Open it by assigning new file handle
@@ -493,7 +558,7 @@ static int vram_mkdir(const char* path, mode_t) {
     scoped_lock local_lock(fslock);
 
     // Fail if entry with that name already exists
-    int64_t entry = index_find(db, path);
+    int64_t entry = index_find(path);
     if (entry > 0) return -EEXIST;
 
     // Split path in parent directory and new directory name parts
@@ -501,14 +566,28 @@ static int vram_mkdir(const char* path, mode_t) {
     split_file_path(path, parent, dir);
 
     // Check if parent directory exists
-    entry = index_find(db, parent.c_str(), entry_type::dir);
+    entry = index_find(parent.c_str(), entry_type::dir);
     if (entry < 0) return entry;
 
     // Create new directory
-    auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, mode, dir, size) VALUES (?, ?, ?, 1, 0)");
+    auto stmt = prepare_query(
+            "INSERT INTO entries (parent, name, mode, dir, size, atime_sec," \
+            "atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec) VALUES" \
+            "(?, ?, ?, 1, 0, ?, ?, ?, ?, ?, ?)");
+
+    timespec tv_now = get_time();
+
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_bind_text(stmt, 2, dir.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 3, DEFAULT_DIR_MODE);
+
+    sqlite3_bind_int64(stmt, 4, tv_now.tv_sec);
+    sqlite3_bind_int64(stmt, 5, tv_now.tv_nsec);
+    sqlite3_bind_int64(stmt, 6, tv_now.tv_sec);
+    sqlite3_bind_int64(stmt, 7, tv_now.tv_nsec);
+    sqlite3_bind_int64(stmt, 8, tv_now.tv_sec);
+    sqlite3_bind_int64(stmt, 9, tv_now.tv_nsec);
+
     sqlite3_step(stmt);
 
     return 0;
@@ -522,7 +601,7 @@ static int vram_symlink(const char* target, const char* path) {
     scoped_lock local_lock(fslock);
 
     // Fail if an entry with that name already exists
-    int64_t entry = index_find(db, path);
+    int64_t entry = index_find(path);
     if (entry > 0) return -EEXIST;
 
     // Split path in parent directory and new symlink name
@@ -530,15 +609,29 @@ static int vram_symlink(const char* target, const char* path) {
     split_file_path(path, parent, name);
 
     // Check if parent directory exists
-    entry = index_find(db, parent.c_str(), entry_type::dir);
+    entry = index_find(parent.c_str(), entry_type::dir);
     if (entry < 0) return entry;
 
     // Create new symlink - target is only resolved at usage
-    auto stmt = prepare_query(db, "INSERT INTO entries (parent, name, target, size) VALUES (?, ?, ?, ?)");
+    auto stmt = prepare_query(
+            "INSERT INTO entries (parent, name, target, size, atime_sec," \
+            "atime_nsec, mtime_sec, mtime_nsec, ctime_sec, ctime_nsec) VALUES" \
+            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+
+    timespec tv_now = get_time();
+
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_bind_text(stmt, 2, name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(stmt, 3, target, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 4, strlen(target));
+
+    sqlite3_bind_int64(stmt, 5, tv_now.tv_sec);
+    sqlite3_bind_int64(stmt, 6, tv_now.tv_nsec);
+    sqlite3_bind_int64(stmt, 7, tv_now.tv_sec);
+    sqlite3_bind_int64(stmt, 8, tv_now.tv_nsec);
+    sqlite3_bind_int64(stmt, 9, tv_now.tv_sec);
+    sqlite3_bind_int64(stmt, 10, tv_now.tv_nsec);
+
     sqlite3_step(stmt);
 
     return 0;
@@ -554,11 +647,11 @@ static int vram_symlink(const char* target, const char* path) {
 static int vram_unlink(const char* path) {
     scoped_lock local_lock(fslock);
 
-    int64_t entry = index_find(db, path, entry_type::link | entry_type::file);
+    int64_t entry = index_find(path, entry_type::link | entry_type::file);
     if (entry < 0) return entry;
 
     // Also works for links
-    delete_file(db, entry);
+    delete_file(entry);
 
     return 0;
 }
@@ -571,11 +664,11 @@ static int vram_rmdir(const char* path) {
     scoped_lock local_lock(fslock);
 
     // Fail if entry doesn't exist or is a file
-    int64_t entry = index_find(db, path, entry_type::dir);
+    int64_t entry = index_find(path, entry_type::dir);
     if (entry < 0) return entry;
 
     // Check if directory is empty
-    auto stmt = prepare_query(db, "SELECT COUNT(*) FROM entries WHERE parent = ?");
+    auto stmt = prepare_query("SELECT COUNT(*) FROM entries WHERE parent = ?");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_step(stmt);
 
@@ -584,7 +677,7 @@ static int vram_rmdir(const char* path) {
     }
 
     // Remove directory
-    stmt = prepare_query(db, "DELETE FROM entries WHERE id = ?");
+    stmt = prepare_query("DELETE FROM entries WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, entry);
     sqlite3_step(stmt);
 
@@ -599,26 +692,28 @@ static int vram_rename(const char* path, const char* new_path) {
     scoped_lock local_lock(fslock);
 
     // Look up entry
-    int64_t entry = index_find(db, path);
+    int64_t entry = index_find(path);
     if (entry < 0) return entry;
 
     // Check if destination directory exists
     std::string dir, new_name;
     split_file_path(new_path, dir, new_name);
 
-    int64_t parent = index_find(db, dir.c_str(), entry_type::dir);
+    int64_t parent = index_find(dir.c_str(), entry_type::dir);
     if (parent < 0) return parent;
 
     // If the destination entry already exists, then delete it
-    int64_t dest_entry = index_find(db, new_path);
-    if (dest_entry >= 0) delete_file(db, dest_entry);
+    int64_t dest_entry = index_find(new_path);
+    if (dest_entry >= 0) delete_file(dest_entry);
 
     // Update index
-    auto stmt = prepare_query(db, "UPDATE entries SET parent = ?, name = ? WHERE id = ?");
+    auto stmt = prepare_query("UPDATE entries SET parent = ?, name = ? WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, parent);
     sqlite3_bind_text(stmt, 2, new_name.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(stmt, 3, entry);
     sqlite3_step(stmt);
+
+    set_entry_ctime(entry, get_time());
 
     return 0;
 }
@@ -631,7 +726,7 @@ static int vram_open(const char* path, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
 
     // Look up file
-    int64_t entry = index_find(db, path, entry_type::file);
+    int64_t entry = index_find(path, entry_type::file);
 
     if (entry > 0) {
         fi->fh = reinterpret_cast<uint64_t>(new file_session(entry, *ocl_proto_queue));
@@ -650,7 +745,7 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
     scoped_lock local_lock(fslock);
     file_session* session = reinterpret_cast<file_session*>(fi->fh);
 
-    size_t file_size = get_file_size(db, session->entry);
+    size_t file_size = get_file_size(session->entry);
     if ((size_t) off >= file_size) return 0;
     size = std::min(file_size - off, size);
 
@@ -669,7 +764,7 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
         off_t block_off = off - block_start;
         size_t read_size = std::min(BLOCK_SIZE - block_off, size);
 
-        cl::Buffer* ocl_buf = get_block(db, session->entry, block_start);
+        cl::Buffer* ocl_buf = get_block(session->entry, block_start);
 
         // Allow multiple threads to block for reading simultaneously
         fslock.unlock();
@@ -685,6 +780,8 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
         off += read_size;
         size -= read_size;
     }
+
+    session->read = true;
 
     return total_read;
 }
@@ -711,10 +808,10 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
         off_t block_off = off - block_start;
         size_t write_size = std::min(BLOCK_SIZE - block_off, size);
 
-        cl::Buffer* ocl_buf = get_block(db, session->entry, block_start);
+        cl::Buffer* ocl_buf = get_block(session->entry, block_start);
 
         if (!ocl_buf) {
-            bool r = create_block(db, session->queue, session->entry, block_start, &ocl_buf);
+            bool r = create_block(session->queue, session->entry, block_start, &ocl_buf);
 
             // Failed to allocate buffer, likely out of VRAM
             if (!r) break;
@@ -735,11 +832,12 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
         size -= write_size;
     }
 
-    if (get_file_size(db, session->entry) < (size_t) off) {
-        set_file_size(db, session->entry, off);
+    if (get_file_size(session->entry) < (size_t) off) {
+        set_file_size(session->entry, off);
     }
 
     session->dirty = true;
+    session->write = true;
 
     if (off < end_pos) {
         return -ENOSPC;
@@ -769,6 +867,9 @@ static int vram_release(const char* path, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
     file_session* session = reinterpret_cast<file_session*>(fi->fh);
 
+    if (session->read) set_entry_atime(session->entry, get_time());
+    if (session->write) set_entry_mtime(session->entry, get_time());
+
     session->queue.finish();
 
     delete session;
@@ -783,10 +884,11 @@ static int vram_release(const char* path, fuse_file_info* fi) {
 static int vram_truncate(const char* path, off_t size) {
     scoped_lock local_lock(fslock);
 
-    int64_t entry = index_find(db, path, entry_type::file);
+    int64_t entry = index_find(path, entry_type::file);
     if (entry < 0) return entry;
 
-    set_file_size(db, entry, size);
+    set_file_size(entry, size);
+    set_entry_mtime(entry, get_time());
 
     return 0;
 }
@@ -797,7 +899,7 @@ static int vram_truncate(const char* path, off_t size) {
 
 static void vram_destroy(void* userdata) {
     // Clean up active OpenCL buffers
-    auto stmt = prepare_query(db, "SELECT buffer FROM blocks");
+    auto stmt = prepare_query("SELECT buffer FROM blocks");
 
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         delete reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));

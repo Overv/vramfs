@@ -38,6 +38,7 @@ namespace cl {
 
     class Context {
     public:
+        Context() {}
         Context(Device& device) {}
     };
 
@@ -57,6 +58,7 @@ namespace cl {
 
     class CommandQueue {
     public:
+        CommandQueue() {}
         CommandQueue(Context& ctx, Device& device) {}
 
         int enqueueFillBuffer(Buffer& buf, int pattern, int off, int size, void* events, void* event) {

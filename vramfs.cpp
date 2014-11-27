@@ -74,9 +74,9 @@ static std::mutex fslock;
 static sqlite3* db;
 
 // OpenCL context, GPU device and prototype queue to create others from
-static cl::Context* ocl_context;
-static cl::Device* ocl_device;
-static cl::CommandQueue* ocl_proto_queue;
+static cl::Context ocl_context;
+static cl::Device ocl_device;
+static cl::CommandQueue ocl_proto_queue;
 
 // Prepared statement cache
 static std::unordered_map<std::string, sqlite3_stmt*> prepared_statements;
@@ -152,7 +152,7 @@ static cl::Buffer* get_block(int64_t entry, off_t off) {
 static bool create_block(cl::CommandQueue& queue, int64_t entry, off_t off, cl::Buffer** buf) {
     int r;
 
-    auto ocl_buf = new cl::Buffer(*ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
+    auto ocl_buf = new cl::Buffer(ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
     if (r != CL_SUCCESS) return false;
 
     // Initialise with zeros
@@ -347,11 +347,11 @@ static void* vram_init(fuse_conn_info* conn) {
     platforms[0].getDevices(CL_DEVICE_TYPE_GPU, &gpu_devices);
     if (gpu_devices.size() == 0) return fatal_error("no opencl capable gpu found", nullptr);
 
-    ocl_context = new cl::Context(gpu_devices[0]);
-    ocl_device = new cl::Device(gpu_devices[0]);
-    ocl_proto_queue = new cl::CommandQueue(*ocl_context, *ocl_device);
+    ocl_device = gpu_devices[0];
+    ocl_context = cl::Context(ocl_device);
+    ocl_proto_queue = cl::CommandQueue(ocl_context, ocl_device);
 
-    return db;
+    return nullptr;
 }
 
 /*
@@ -545,7 +545,7 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
 
     // Open it by assigning new file handle
     entry = sqlite3_last_insert_rowid(db);
-    fi->fh = reinterpret_cast<uint64_t>(new file_session(entry, *ocl_proto_queue));
+    fi->fh = reinterpret_cast<uint64_t>(new file_session(entry, ocl_proto_queue));
 
     return 0;
 }
@@ -729,7 +729,7 @@ static int vram_open(const char* path, fuse_file_info* fi) {
     int64_t entry = index_find(path, entry_type::file);
 
     if (entry > 0) {
-        fi->fh = reinterpret_cast<uint64_t>(new file_session(entry, *ocl_proto_queue));
+        fi->fh = reinterpret_cast<uint64_t>(new file_session(entry, ocl_proto_queue));
         return 0;
     } else {
         // Return entry find error if it wasn't found
@@ -905,18 +905,13 @@ static void vram_destroy(void* userdata) {
         delete reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
     }
 
-    // Clean up the rest of OpenCL
-    delete ocl_proto_queue;
-    delete ocl_device;
-    delete ocl_context;
-
     // Clean up prepared statements
     for (auto& pair : prepared_statements) {
         sqlite3_finalize(pair.second);
     }
 
     // Clean up index database
-    sqlite3_close(reinterpret_cast<sqlite3*>(userdata));
+    sqlite3_close(db);
 }
 
 /*

@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cstdint>
 #include <mutex>
+#include <map>
 #include <unordered_map>
 
 // Internal dependencies
@@ -34,25 +35,17 @@ static const char* entries_table_sql =
         // Default size for directories
         "size INTEGER DEFAULT 4096," \
         // SQLite doesn't have nanosecond time, so no sensible default
-        "atime_sec INTEGER DEFAULT 0," \
+        "atime_sec INTEGER DEFAULT (STRFTIME('%s'))," \
         "atime_nsec INTEGER DEFAULT 0," \
-        "mtime_sec INTEGER DEFAULT 0," \
+        "mtime_sec INTEGER DEFAULT (STRFTIME('%s'))," \
         "mtime_nsec INTEGER DEFAULT 0," \
-        "ctime_sec INTEGER DEFAULT 0," \
+        "ctime_sec INTEGER DEFAULT (STRFTIME('%s'))," \
         "ctime_nsec INTEGER DEFAULT 0," \
         // Target if this entry is a symlink
         "target TEXT" \
     ")";
 
-static const char* blocks_table_sql =
-    "CREATE TABLE blocks(" \
-        "entry INTEGER NOT NULL," \
-        // Start offset of block
-        "off INTEGER NOT NULL," \
-        // OpenCL buffer
-        "buffer INTEGER NOT NULL" \
-    ")";
-
+// Nicely fits FUSE read/write size
 static const size_t BLOCK_SIZE = 128 * 1024;
 
 static const int ROOT_PARENT = 0;
@@ -73,13 +66,16 @@ static std::mutex fslock;
 // Connection to file system database
 static sqlite3* db;
 
+// Prepared statement cache
+static std::unordered_map<std::string, sqlite3_stmt*> prepared_statements;
+
 // OpenCL context, GPU device and prototype queue to create others from
 static cl::Context ocl_context;
 static cl::Device ocl_device;
 static cl::CommandQueue ocl_proto_queue;
 
-// Prepared statement cache
-static std::unordered_map<std::string, sqlite3_stmt*> prepared_statements;
+// File blocks
+static std::map<entry_off, cl::Buffer> file_blocks;
 
 /*
  * Helpers
@@ -134,56 +130,48 @@ static void split_file_path(const std::string& path, std::string& dir, std::stri
     }
 }
 
-// Get the OpenCL buffer of the block starting at *off* or nullptr if the block
-// hasn't been written yet
-static cl::Buffer* get_block(int64_t entry, off_t off) {
-    auto stmt = prepare_query("SELECT buffer FROM blocks WHERE entry = ? AND off = ?");
-    sqlite3_bind_int64(stmt, 1, entry);
-    sqlite3_bind_int64(stmt, 2, off);
+// Get the OpenCL buffer of the block if it exists (returning true)
+static bool get_block(int64_t entry, off_t off, cl::Buffer& buf) {
+    auto it = file_blocks.find(entry_off(entry, off));
 
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        return reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
+    if (it != file_blocks.end()) {
+        buf = it->second;
+        return true;
     } else {
-        return nullptr;
+        return false;
     }
 }
 
 // Allocate new block, buf is only set on success (returning true)
-static bool create_block(cl::CommandQueue& queue, int64_t entry, off_t off, cl::Buffer** buf) {
+static bool create_block(cl::CommandQueue& queue, int64_t entry, off_t off, cl::Buffer& buf) {
     int r;
-
-    auto ocl_buf = new cl::Buffer(ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
+    cl::Buffer ocl_buf(ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
     if (r != CL_SUCCESS) return false;
 
-    // Initialise with zeros
-    r = queue.enqueueFillBuffer(*ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
+    // Initialise with zeros (out-of-memory error usually occurs at this point)
+    r = queue.enqueueFillBuffer(ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
     if (r != CL_SUCCESS) return false;
 
-    auto stmt = prepare_query("INSERT INTO blocks (entry, off, buffer) VALUES (?, ?, ?)");
-    sqlite3_bind_int64(stmt, 1, entry);
-    sqlite3_bind_int64(stmt, 2, off);
-    sqlite3_bind_int64(stmt, 3, reinterpret_cast<int64_t>(ocl_buf));
-    sqlite3_step(stmt);
-
-    *buf = ocl_buf;
+    file_blocks[entry_off(entry, off)] = ocl_buf;
+    buf = ocl_buf;
 
     return true;
 }
 
 // Delete all blocks with a starting offset >= *off*
 static void delete_blocks(int64_t entry, off_t off = 0) {
-    auto stmt = prepare_query("SELECT buffer FROM blocks WHERE entry = ? AND off >= ?");
-    sqlite3_bind_int64(stmt, 1, entry);
-    sqlite3_bind_int64(stmt, 2, off);
+    // Determine lowest block within range
+    off_t start_off = (off / BLOCK_SIZE) * BLOCK_SIZE;
 
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        delete reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
+    for (auto it = file_blocks.find(entry_off(entry, start_off)); it != file_blocks.end();) {
+        if (it->first.entry == entry && it->first.off >= off) {
+            it = file_blocks.erase(it);
+        } else if (it->first.entry != entry) {
+            break;
+        } else {
+            it++;
+        }
     }
-
-    stmt = prepare_query("DELETE FROM blocks WHERE entry = ? AND off >= ?");
-    sqlite3_bind_int64(stmt, 1, entry);
-    sqlite3_bind_int64(stmt, 2, off);
-    sqlite3_step(stmt);
 }
 
 // Delete a file entry and its blocks
@@ -207,12 +195,14 @@ static size_t get_file_size(int64_t entry) {
 
 // Change file size, any blocks beyond the size will be automatically removed
 static void set_file_size(int64_t entry, size_t size) {
+    if (get_file_size(entry) > size) {
+        delete_blocks(entry, size);
+    }
+
     auto stmt = prepare_query("UPDATE entries SET size = ? WHERE id = ?");
     sqlite3_bind_int64(stmt, 1, size);
     sqlite3_bind_int64(stmt, 2, entry);
     sqlite3_step(stmt);
-
-    delete_blocks(entry, size);
 }
 
 // Set access time of entry
@@ -327,12 +317,6 @@ static void* vram_init(fuse_conn_info* conn) {
 
     r = sqlite3_exec(db, "CREATE INDEX idx_name ON entries (parent, name)", nullptr, nullptr, nullptr);
     if (r) return fatal_error("failed to create db index", nullptr);
-
-    r = sqlite3_exec(db, blocks_table_sql, nullptr, nullptr, nullptr);
-    if (r) return fatal_error("failed to create blocks table", nullptr);
-
-    r = sqlite3_exec(db, "CREATE INDEX idx_block ON blocks (entry, off)", nullptr, nullptr, nullptr);
-    if (r) return fatal_error("failed to create block index", nullptr);
 
     // Add root directory, which is its own parent
     r = sqlite3_exec(db, "INSERT INTO entries (id, name, dir) VALUES (1, '', 1)", nullptr, nullptr, nullptr);
@@ -764,12 +748,13 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
         off_t block_off = off - block_start;
         size_t read_size = std::min(BLOCK_SIZE - block_off, size);
 
-        cl::Buffer* ocl_buf = get_block(session->entry, block_start);
+        cl::Buffer ocl_buf;
+        bool buf_exists = get_block(session->entry, block_start, ocl_buf);
 
         // Allow multiple threads to block for reading simultaneously
         fslock.unlock();
-        if (ocl_buf) {
-            session->queue.enqueueReadBuffer(*ocl_buf, true, block_off, read_size, buf, nullptr, nullptr);
+        if (buf_exists) {
+            session->queue.enqueueReadBuffer(ocl_buf, true, block_off, read_size, buf, nullptr, nullptr);
         } else {
             // Non-written part of file
             memset(buf, 0, read_size);
@@ -808,13 +793,14 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
         off_t block_off = off - block_start;
         size_t write_size = std::min(BLOCK_SIZE - block_off, size);
 
-        cl::Buffer* ocl_buf = get_block(session->entry, block_start);
+        cl::Buffer ocl_buf;
+        bool buf_exists = get_block(session->entry, block_start, ocl_buf);
 
-        if (!ocl_buf) {
-            bool r = create_block(session->queue, session->entry, block_start, &ocl_buf);
+        if (!buf_exists) {
+            buf_exists = create_block(session->queue, session->entry, block_start, ocl_buf);
 
             // Failed to allocate buffer, likely out of VRAM
-            if (!r) break;
+            if (!buf_exists) break;
         }
 
         // Make copy of buffer for OpenCL to do asynchronous write
@@ -822,7 +808,7 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
         memcpy(buf_copy, buf, write_size);
 
         cl::Event event;
-        session->queue.enqueueWriteBuffer(*ocl_buf, false, block_off, write_size, buf_copy, nullptr, &event);
+        session->queue.enqueueWriteBuffer(ocl_buf, false, block_off, write_size, buf_copy, nullptr, &event);
 
         // Callback on completion to clean up the buffer copy
         event.setCallback(CL_COMPLETE, write_cb, buf_copy);
@@ -898,13 +884,6 @@ static int vram_truncate(const char* path, off_t size) {
  */
 
 static void vram_destroy(void* userdata) {
-    // Clean up active OpenCL buffers
-    auto stmt = prepare_query("SELECT buffer FROM blocks");
-
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        delete reinterpret_cast<cl::Buffer*>(sqlite3_column_int64(stmt, 0));
-    }
-
     // Clean up prepared statements
     for (auto& pair : prepared_statements) {
         sqlite3_finalize(pair.second);

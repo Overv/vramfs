@@ -44,16 +44,14 @@ namespace cl {
 
     class Buffer {
     public:
+        Buffer() {}
+
         Buffer(Context& ctx, int flags, int64_t size, void* host_ptr = nullptr, int* err = nullptr) {
-            data = new char[size];
+            data.resize(size);
             if (err) *err = CL_SUCCESS;
         }
 
-        ~Buffer() {
-            delete [] data;
-        }
-
-        char* data;
+        std::vector<char> data;
     };
 
     class CommandQueue {

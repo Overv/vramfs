@@ -46,4 +46,23 @@ struct file_session {
     file_session(int64_t entry, cl::CommandQueue queue) : entry(entry), queue(queue), dirty(false) {}
 };
 
+/*
+ * File entry and offset for block for use as key in unordered_map
+ */
+
+struct entry_off {
+    int64_t entry;
+    off_t off;
+
+    entry_off(int64_t entry, off_t off) : entry(entry), off(off) {}
+
+    bool operator<(const entry_off& other) const {
+        if (entry == other.entry) {
+            return off < other.off;
+        } else {
+            return entry < other.entry;
+        }
+    }
+};
+
 #endif

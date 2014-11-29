@@ -133,6 +133,8 @@ static void delete_blocks(shared_ptr<entry_t> entry, off_t off = 0) {
 
 // Delete an entry and its blocks (in case it's a file)
 static int delete_entry(shared_ptr<entry_t> entry) {
+    if (entry->parent) entry->parent->ctime = entry->parent->mtime = get_time();
+
     entries.erase(entry);
 
     delete_blocks(entry);
@@ -357,6 +359,8 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
         filler(buf, e->name.c_str(), nullptr, 0);
     }
 
+    entry->ctime = entry->atime = get_time();
+
     return 0;
 }
 
@@ -375,9 +379,10 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     std::string dir, file;
     split_file_path(path, dir, file);
 
-    // Check if directory exists
+    // Check if parent directory exists
     err = index_find(dir, entry, entry_type::dir);
     if (err != 0) return err;
+    entry->ctime = entry->mtime = get_time();
 
     entry = make_entry(entry);
     entry->name = file;
@@ -408,6 +413,7 @@ static int vram_mkdir(const char* path, mode_t) {
     // Check if parent directory exists
     err = index_find(parent, entry, entry_type::dir);
     if (err != 0) return err;
+    entry->ctime = entry->mtime = get_time();
 
     // Create new directory
     entry = make_entry(entry);
@@ -437,6 +443,7 @@ static int vram_symlink(const char* target, const char* path) {
     // Check if parent directory exists
     err = index_find(parent, entry, entry_type::dir);
     if (err != 0) return err;
+    entry->ctime = entry->mtime = get_time();
 
     // Create new symlink - target is only resolved at usage
     entry = make_entry(entry);
@@ -507,6 +514,7 @@ static int vram_rename(const char* path, const char* new_path) {
     shared_ptr<entry_t> parent;
     err = index_find(dir, parent, entry_type::dir);
     if (err != 0) return err;
+    parent->ctime = parent->mtime = get_time();
 
     // If the destination entry already exists, then delete it
     shared_ptr<entry_t> dest_entry;
@@ -686,7 +694,7 @@ static int vram_truncate(const char* path, off_t size) {
     if (err != 0) return err;
 
     set_file_size(entry, size);
-    entry->mtime = get_time();
+    entry->ctime = entry->mtime = get_time();
 
     return 0;
 }

@@ -59,7 +59,7 @@ static std::map<entry_off, cl::Buffer> file_blocks;
 
 // Error function that can be combined with a return statement to return *ret*
 template<typename T>
-static T fatal_error(const char* error, T ret) {
+static T fatal_error(const std::string& error, T ret) {
     std::cerr << "error: " << error << std::endl;
     fuse_exit(fuse_get_context()->fuse);
     return ret;
@@ -653,8 +653,8 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
 
 static int vram_fsync(const char* path, int, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
-    file_session* session = reinterpret_cast<file_session*>(fi->fh);
 
+    file_session* session = reinterpret_cast<file_session*>(fi->fh);
     session->queue.finish();
 
     return 0;
@@ -666,10 +666,9 @@ static int vram_fsync(const char* path, int, fuse_file_info* fi) {
 
 static int vram_release(const char* path, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
+
     file_session* session = reinterpret_cast<file_session*>(fi->fh);
-
     session->queue.finish();
-
     delete session;
 
     return 0;

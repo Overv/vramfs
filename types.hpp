@@ -3,7 +3,8 @@
 
 #include <thread>
 #include <memory>
-#include <sqlite3.h>
+
+using std::shared_ptr;
 
 /*
  * Types of objects in the file system, can be combined for index_find filter
@@ -31,19 +32,31 @@ public:
 };
 
 /*
- * Data persistent in an open() and release() session
+ * Entry description in file system index
  */
 
-struct file_session {
-    int64_t entry;
-    cl::CommandQueue queue;
-    // Set to true by write() so that read() knows to wait for OpenCL writes
-    bool dirty;
-    // Set to true when read() / write() are called to update file times
-    bool read = false;
-    bool write = false;
+struct entry_t {
+    // Entries are in the root by default
+    std::shared_ptr<entry_t> parent = nullptr;
+    std::string name;
+    bool dir = false;
+    int mode = 0;
+    // Default directory size
+    size_t size = 4096;
+    timespec atime;
+    timespec mtime;
+    timespec ctime;
+    // Target if this entry is a symlink
+    std::string target;
 
-    file_session(int64_t entry, cl::CommandQueue queue) : entry(entry), queue(queue), dirty(false) {}
+    entry_t() {
+        timespec t;
+        clock_gettime(CLOCK_REALTIME, &t);
+
+        atime = t;
+        mtime = t;
+        ctime = t;
+    }
 };
 
 /*
@@ -51,10 +64,10 @@ struct file_session {
  */
 
 struct entry_off {
-    int64_t entry;
+    shared_ptr<entry_t> entry;
     off_t off;
 
-    entry_off(int64_t entry, off_t off) : entry(entry), off(off) {}
+    entry_off(shared_ptr<entry_t> entry, off_t off) : entry(entry), off(off) {}
 
     bool operator<(const entry_off& other) const {
         if (entry == other.entry) {
@@ -63,6 +76,19 @@ struct entry_off {
             return entry < other.entry;
         }
     }
+};
+
+/*
+ * Data persistent in an open() and release() session
+ */
+
+struct file_session {
+    shared_ptr<entry_t> entry;
+    cl::CommandQueue queue;
+    // Set to true by write() so that read() knows to wait for OpenCL writes
+    bool dirty = false;
+
+    file_session(shared_ptr<entry_t> entry, cl::CommandQueue queue) : entry(entry), queue(queue) {}
 };
 
 #endif

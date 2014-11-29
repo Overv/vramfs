@@ -7,6 +7,7 @@
 
 #include <vector>
 #include <cstring>
+#include <memory>
 
 #define CL_CALLBACK
 
@@ -44,14 +45,17 @@ namespace cl {
 
     class Buffer {
     public:
-        Buffer() {}
+        Buffer() {
+            data = std::make_shared<std::vector<char>>();
+        }
 
         Buffer(Context& ctx, int flags, int64_t size, void* host_ptr = nullptr, int* err = nullptr) {
-            data.resize(size);
+            data = std::make_shared<std::vector<char>>();
+            data->resize(size);
             if (err) *err = CL_SUCCESS;
         }
 
-        std::vector<char> data;
+        std::shared_ptr<std::vector<char>> data;
     };
 
     class CommandQueue {
@@ -60,22 +64,22 @@ namespace cl {
         CommandQueue(Context& ctx, Device& device) {}
 
         int enqueueFillBuffer(Buffer& buf, int pattern, int off, int size, void* events, void* event) {
-            memset(&buf.data[off], 0, size);
+            memset(&buf.data->operator[](off), 0, size);
             return CL_SUCCESS;
         }
 
         int enqueueCopyBuffer(Buffer& src, Buffer& dst, int offSrc, int offDst, int size, void* events, void* event) {
-            memcpy(&dst.data[offDst], &src.data[offSrc], size);
+            memcpy(&dst.data->operator[](offDst), &src.data->operator[](offSrc), size);
             return CL_SUCCESS;
         }
 
         int enqueueReadBuffer(Buffer& buf, bool block, int off, int size, char* out, void* events, void* event) {
-            memcpy(out, &buf.data[off], size);
+            memcpy(out, &buf.data->operator[](off), size);
             return CL_SUCCESS;
         }
 
         int enqueueWriteBuffer(Buffer& buf, bool block, int off, int size, const char* in, void* events, void* event) {
-            memcpy(&buf.data[off], in, size);
+            memcpy(&buf.data->operator[](off), in, size);
             return CL_SUCCESS;
         }
 

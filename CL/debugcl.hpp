@@ -40,7 +40,7 @@ namespace cl {
     class Context {
     public:
         Context() {}
-        Context(Device& device) {}
+        Context(std::vector<Device>& devices) {}
     };
 
     class Buffer {

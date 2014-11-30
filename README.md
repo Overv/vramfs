@@ -2,7 +2,7 @@ vramfs
 ======
 
 vramfs is a utility that uses the [FUSE library](http://fuse.sourceforge.net/)
-to implement a file system in VRAM. The idea is pretty much the same as a RAM
+to create a file system in VRAM. The idea is pretty much the same as a RAM
 disk, except that it uses the video RAM of a discrete graphics card to store
 files. It is not intented for serious use, but it does actually work fairly
 well, especially since consumer GPUs with 4GB or more VRAM are now available.
@@ -14,7 +14,7 @@ Requirements
 
 - Linux
 - FUSE development files
-- A graphics card with support for OpenCL 1.2+
+- A graphics card with support for OpenCL 1.1
 
 Instructions
 ------------

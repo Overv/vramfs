@@ -4,9 +4,13 @@
 #include <unistd.h>
 #include <sqlite3.h>
 
-// Use minimal OpenCL implementation for better debugging with valgrind
 #ifdef DEBUG
-#include "extras/debugcl.hpp"
+// Use minimal OpenCL implementation for better debugging with valgrind
+#include "CL/debugcl.hpp"
+#elif OPENCL_1_1
+// OpenCL 1.1 header uses deprecated APIs
+#define CL_USE_DEPRECATED_OPENCL_1_1_APIS
+#include "CL/cl.hpp"
 #else
 #include <CL/cl.hpp>
 #endif
@@ -52,6 +56,11 @@ static cl::CommandQueue ocl_proto_queue;
 
 // File blocks
 static std::map<entry_off, cl::Buffer> file_blocks;
+
+#ifdef OPENCL_1_1
+// OpenCL buffer with zeros for initialisation instead of clEnqueueFillBuffer
+static cl::Buffer zero_buffer;
+#endif
 
 /*
  * Helpers
@@ -106,8 +115,13 @@ static bool create_block(cl::CommandQueue& queue, shared_ptr<entry_t> entry, off
     if (r != CL_SUCCESS) return false;
 
     // Initialise with zeros (out-of-memory error usually occurs at this point)
+#ifdef OPENCL_1_1
+    r = queue.enqueueCopyBuffer(zero_buffer, ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
+    if (r != CL_SUCCESS) return false;
+#else
     r = queue.enqueueFillBuffer(ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
     if (r != CL_SUCCESS) return false;
+#endif
 
     file_blocks[entry_off(entry, off)] = ocl_buf;
     buf = ocl_buf;
@@ -196,17 +210,15 @@ static int index_find(const std::string& path, shared_ptr<entry_t>& entry, int f
     std::string part;
 
     // If the path is empty, assume the root directory
-    //if (path.size() != 0) {
-        while (getline(stream, part, '/')) {
-            // If current directory is actually a file, abort
-            if (!entry->dir) return -ENOTDIR;
+    while (getline(stream, part, '/')) {
+        // If current directory is actually a file, abort
+        if (!entry->dir) return -ENOTDIR;
 
-            entry = find_entry(entry, part);
+        entry = find_entry(entry, part);
 
-            // If entry was not found, abort
-            if (!entry) return -ENOENT;
-        }
-    //}
+        // If entry was not found, abort
+        if (!entry) return -ENOENT;
+    }
 
     // If an undesired type of entry was found, return an appropriate error
     int actual_type = entry->target.size() > 0 ? entry_type::link :
@@ -242,15 +254,29 @@ static void* vram_init(fuse_conn_info* conn) {
     cl::Platform::get(&platforms);
     if (platforms.size() == 0) return fatal_error("no opencl platform found", nullptr);
 
-    std::vector<cl::Device> gpu_devices;
-    platforms[0].getDevices(CL_DEVICE_TYPE_GPU, &gpu_devices);
-    if (gpu_devices.size() == 0) return fatal_error("no opencl capable gpu found", nullptr);
+    // Search platforms for GPU devices
+    for (auto& platform : platforms) {
+        std::vector<cl::Device> gpu_devices;
+        platform.getDevices(CL_DEVICE_TYPE_GPU, &gpu_devices);
+        if (gpu_devices.size() == 0) continue;
 
-    ocl_device = gpu_devices[0];
-    ocl_context = cl::Context(ocl_device);
-    ocl_proto_queue = cl::CommandQueue(ocl_context, ocl_device);
+        ocl_device = gpu_devices[0];
+        ocl_context = cl::Context(gpu_devices);
+        ocl_proto_queue = cl::CommandQueue(ocl_context, ocl_device);
 
-    return nullptr;
+#ifdef OPENCL_1_1
+        char zero_data[BLOCK_SIZE] = {};
+        int r;
+        zero_buffer = cl::Buffer(ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
+        if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", nullptr);
+        r = ocl_proto_queue.enqueueWriteBuffer(zero_buffer, true, 0, BLOCK_SIZE, zero_data, nullptr, nullptr);
+        if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", nullptr);
+#endif
+
+        return nullptr;
+    }
+
+    return fatal_error("no opencl capable gpu found", nullptr);
 }
 
 /*

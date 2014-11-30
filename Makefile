@@ -1,5 +1,5 @@
 CC = g++
-CFLAGS = -O3 -flto -Wall -Werror -std=c++11
+CFLAGS = -march=native -O2 -flto -Wall -Werror -std=c++11
 
 ifeq ($(DEBUG), 1)
 	CFLAGS += -g -DDEBUG

@@ -30,9 +30,6 @@
 // Nicely fits FUSE read/write size
 static const size_t BLOCK_SIZE = 128 * 1024;
 
-static const int ROOT_PARENT = 0;
-static const int ROOT_ENTRY = 1;
-
 static const int DEFAULT_FILE_MODE = 0664;
 static const int DEFAULT_DIR_MODE = 0775;
 

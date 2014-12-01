@@ -42,8 +42,7 @@ static const int DEFAULT_DIR_MODE = 0775;
 // with the uncountable amount of race conditions that would otherwise occur.
 static std::mutex fslock;
 
-// File system index
-static std::unordered_set<shared_ptr<entry_t>> entries;
+// File system root that links to the rest
 static shared_ptr<entry_t> root_entry;
 
 // OpenCL context, GPU device and prototype queue to create others from
@@ -65,7 +64,7 @@ static cl::Buffer zero_buffer;
 
 // Error function that can be combined with a return statement to return *ret*
 template<typename T>
-static T fatal_error(const std::string& error, T ret) {
+static T fatal_error(const string& error, T ret) {
     std::cerr << "error: " << error << std::endl;
     fuse_exit(fuse_get_context()->fuse);
     return ret;
@@ -79,10 +78,10 @@ static timespec get_time() {
 }
 
 // Split path/to/file.txt into "path/to" and "file.txt"
-static void split_file_path(const std::string& path, std::string& dir, std::string& file) {
+static void split_file_path(const string& path, string& dir, string& file) {
     size_t p = path.rfind("/");
 
-    if (p == std::string::npos) {
+    if (p == string::npos) {
         dir = "";
         file = path;
     } else {
@@ -146,7 +145,7 @@ static void delete_blocks(shared_ptr<entry_t> entry, off_t off = 0) {
 static int delete_entry(shared_ptr<entry_t> entry) {
     if (entry->parent) entry->parent->ctime = entry->parent->mtime = get_time();
 
-    entries.erase(entry);
+    entry->parent->children.erase(entry->name);
 
     delete_blocks(entry);
 
@@ -163,40 +162,33 @@ static void set_file_size(shared_ptr<entry_t> entry, size_t size) {
 }
 
 // Create a new entry
-static shared_ptr<entry_t> make_entry(shared_ptr<entry_t> parent) {
-    auto e = std::make_shared<entry_t>();
-    e->parent = parent;
-    entries.insert(e);
+static shared_ptr<entry_t> make_entry(entry_t* parent, string name) {
+    auto entry = std::make_shared<entry_t>();
 
-    return e;
-}
+    entry->parent = parent;
+    entry->name = name;
 
-// Find entry by parent and name
-static shared_ptr<entry_t> find_entry(shared_ptr<entry_t> parent, std::string name) {
-    for (auto& e : entries) {
-        if (e->parent == parent && e->name == name) {
-            return e;
-        }
+    if (parent) {
+        parent->children[name] = entry;
     }
 
-    return nullptr;
+    return entry;
 }
 
-// Find entries by parent
-static std::vector<shared_ptr<entry_t>> find_entries(shared_ptr<entry_t> parent) {
-    std::vector<shared_ptr<entry_t>> results;
+// Move an entry
+static void move_entry(shared_ptr<entry_t> entry, entry_t* new_parent, const string& new_name) {
+    entry->parent->children.erase(entry->name);
 
-    for (auto& e : entries) {
-        if (e->parent == parent) {
-            results.push_back(e);
-        }
+    entry->parent = new_parent;
+    entry->name = new_name;
+
+    if (new_parent) {
+        new_parent->children[new_name] = entry;
     }
-
-    return results;
 }
 
 // Find entry by path (starting with /)
-static int index_find(const std::string& path, shared_ptr<entry_t>& entry, int filter = entry_type::all) {
+static int index_find(const string& path, shared_ptr<entry_t>& entry, int filter = entry_type::all) {
     // If filter is empty, no entry will ever match
     if ((filter & entry_type::all) == 0) return -ENOENT;
 
@@ -204,17 +196,21 @@ static int index_find(const std::string& path, shared_ptr<entry_t>& entry, int f
     entry = root_entry;
 
     std::stringstream stream(path.substr(1));
-    std::string part;
+    string part;
 
     // If the path is empty, assume the root directory
     while (getline(stream, part, '/')) {
         // If current directory is actually a file, abort
         if (!entry->dir) return -ENOTDIR;
 
-        entry = find_entry(entry, part);
+        // Navigate to next entry
+        auto it = entry->children.find(part);
 
-        // If entry was not found, abort
-        if (!entry) return -ENOENT;
+        if (it != entry->children.end()) {
+            entry = it->second;
+        } else {
+            return -ENOENT;
+        }
     }
 
     // If an undesired type of entry was found, return an appropriate error
@@ -243,7 +239,7 @@ static int index_find(const std::string& path, shared_ptr<entry_t>& entry, int f
 
 static void* vram_init(fuse_conn_info* conn) {
     // Create root directory
-    root_entry = make_entry(nullptr);
+    root_entry = make_entry(nullptr, "");
     root_entry->dir = true;
 
     // Create OpenCL context
@@ -378,8 +374,8 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
     filler(buf, ".", nullptr, 0);
     filler(buf, "..", nullptr, 0);
 
-    for (auto e : find_entries(entry)) {
-        filler(buf, e->name.c_str(), nullptr, 0);
+    for (auto& pair : entry->children) {
+        filler(buf, pair.second->name.c_str(), nullptr, 0);
     }
 
     entry->ctime = entry->atime = get_time();
@@ -399,7 +395,7 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     int err = index_find(path, entry);
     if (err == 0) return -EEXIST;
 
-    std::string dir, file;
+    string dir, file;
     split_file_path(path, dir, file);
 
     // Check if parent directory exists
@@ -407,8 +403,7 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     if (err != 0) return err;
     entry->ctime = entry->mtime = get_time();
 
-    entry = make_entry(entry);
-    entry->name = file;
+    entry = make_entry(entry.get(), file);
     entry->mode = DEFAULT_FILE_MODE;
     entry->size = 0;
 
@@ -430,7 +425,7 @@ static int vram_mkdir(const char* path, mode_t) {
     int err = index_find(path, entry);
     if (err == 0) return -EEXIST;
 
-    std::string parent, dir;
+    string parent, dir;
     split_file_path(path, parent, dir);
 
     // Check if parent directory exists
@@ -439,8 +434,7 @@ static int vram_mkdir(const char* path, mode_t) {
     entry->ctime = entry->mtime = get_time();
 
     // Create new directory
-    entry = make_entry(entry);
-    entry->name = dir;
+    entry = make_entry(entry.get(), dir);
     entry->dir = true;
     entry->mode = DEFAULT_DIR_MODE;
 
@@ -460,7 +454,7 @@ static int vram_symlink(const char* target, const char* path) {
     if (err == 0) return -EEXIST;
 
     // Split path in parent directory and new symlink name
-    std::string parent, name;
+    string parent, name;
     split_file_path(path, parent, name);
 
     // Check if parent directory exists
@@ -469,8 +463,7 @@ static int vram_symlink(const char* target, const char* path) {
     entry->ctime = entry->mtime = get_time();
 
     // Create new symlink - target is only resolved at usage
-    entry = make_entry(entry);
-    entry->name = name;
+    entry = make_entry(entry.get(), name);
     entry->target = target;
     entry->size = entry->target.size();
 
@@ -509,7 +502,7 @@ static int vram_rmdir(const char* path) {
     if (err != 0) return err;
 
     // Check if directory is empty
-    if (find_entries(entry).size() != 0) {
+    if (entry->children.size() != 0) {
         return -ENOTEMPTY;
     }
 
@@ -531,7 +524,7 @@ static int vram_rename(const char* path, const char* new_path) {
     if (err != 0) return err;
 
     // Check if destination directory exists
-    std::string dir, new_name;
+    string dir, new_name;
     split_file_path(new_path, dir, new_name);
 
     shared_ptr<entry_t> parent;
@@ -544,8 +537,8 @@ static int vram_rename(const char* path, const char* new_path) {
     err = index_find(new_path, dest_entry);
     if (err == 0) delete_entry(dest_entry);
 
-    entry->parent = parent;
-    entry->name = new_name;
+    move_entry(entry, parent.get(), new_name);
+
     entry->ctime = get_time();
 
     return 0;

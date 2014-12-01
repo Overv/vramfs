@@ -3,8 +3,11 @@
 
 #include <thread>
 #include <memory>
+#include <unordered_map>
 
 using std::shared_ptr;
+using std::weak_ptr;
+using std::string;
 
 /*
  * Types of objects in the file system, can be combined for index_find filter
@@ -36,9 +39,11 @@ public:
  */
 
 struct entry_t {
-    // Entries are in the root by default
-    std::shared_ptr<entry_t> parent = nullptr;
-    std::string name;
+    // Non-owning pointer, parent is guaranteed to exist if entry exists
+    entry_t* parent = nullptr;
+    std::unordered_map<string, shared_ptr<entry_t>> children;
+
+    string name;
     bool dir = false;
     int mode = 0;
     // Default directory size
@@ -47,7 +52,7 @@ struct entry_t {
     timespec mtime;
     timespec ctime;
     // Target if this entry is a symlink
-    std::string target;
+    string target;
 
     entry_t() {
         timespec t;

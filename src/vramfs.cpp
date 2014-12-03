@@ -15,6 +15,7 @@
 
 // Internal dependencies
 #include "types.hpp"
+#include "util.hpp"
 
 using namespace vram;
 
@@ -39,36 +40,6 @@ static std::map<entry_off, memory::block> file_blocks;
 /*
  * Helpers
  */
-
-// Error function that can be combined with a return statement to return *ret*
-template<typename T>
-static T fatal_error(const string& error, T ret) {
-    std::cerr << "error: " << error << std::endl;
-    fuse_exit(fuse_get_context()->fuse);
-    return ret;
-}
-
-// Get current time with nanosecond precision
-static timespec get_time() {
-    timespec tv;
-    clock_gettime(CLOCK_REALTIME_COARSE, &tv);
-    return tv;
-}
-
-// Split path/to/file.txt into "path/to" and "file.txt"
-static void split_file_path(const string& path, string& dir, string& file) {
-    size_t p = path.rfind("/");
-
-    if (p == string::npos) {
-        dir = "";
-        file = path;
-    } else {
-        dir = path.substr(0, p);
-        file = path.substr(p + 1);
-    }
-
-    if (dir.size() == 0) dir = "/";
-}
 
 // Get the OpenCL buffer of the block if it exists (returning true)
 static bool get_block(shared_ptr<entry_t> entry, off_t off, memory::block& buf) {
@@ -113,7 +84,7 @@ static void delete_blocks(shared_ptr<entry_t> entry, off_t off = 0) {
 
 // Delete an entry and its blocks (in case it's a file)
 static int delete_entry(shared_ptr<entry_t> entry) {
-    if (entry->parent) entry->parent->ctime = entry->parent->mtime = get_time();
+    if (entry->parent) entry->parent->ctime = entry->parent->mtime = util::time();
 
     entry->parent->children.erase(entry->name);
 
@@ -214,7 +185,7 @@ static void* vram_init(fuse_conn_info* conn) {
 
     // Check for OpenCL supported GPU
     if (!memory::is_available()) {
-        return fatal_error("no opencl capable gpu found", nullptr);
+        return util::fatal_error("no opencl capable gpu found", nullptr);
     }
 
     return nullptr;
@@ -283,7 +254,7 @@ static int vram_chmod(const char* path, mode_t mode) {
     if (err != 0) return err;
 
     entry->mode = mode;
-    entry->ctime = get_time();
+    entry->ctime = util::time();
 
     return 0;
 }
@@ -301,7 +272,7 @@ static int vram_utimens(const char* path, const timespec tv[2]) {
 
     entry->atime = tv[0];
     entry->mtime = tv[1];
-    entry->ctime = get_time();
+    entry->ctime = util::time();
 
     return 0;
 }
@@ -326,7 +297,7 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
         filler(buf, pair.second->name.c_str(), nullptr, 0);
     }
 
-    entry->ctime = entry->atime = get_time();
+    entry->ctime = entry->atime = util::time();
 
     return 0;
 }
@@ -344,12 +315,12 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     if (err == 0) return -EEXIST;
 
     string dir, file;
-    split_file_path(path, dir, file);
+    util::split_file_path(path, dir, file);
 
     // Check if parent directory exists
     err = index_find(dir, entry, entry_type::dir);
     if (err != 0) return err;
-    entry->ctime = entry->mtime = get_time();
+    entry->ctime = entry->mtime = util::time();
 
     entry = make_entry(entry.get(), file);
     entry->mode = DEFAULT_FILE_MODE;
@@ -374,12 +345,12 @@ static int vram_mkdir(const char* path, mode_t) {
     if (err == 0) return -EEXIST;
 
     string parent, dir;
-    split_file_path(path, parent, dir);
+    util::split_file_path(path, parent, dir);
 
     // Check if parent directory exists
     err = index_find(parent, entry, entry_type::dir);
     if (err != 0) return err;
-    entry->ctime = entry->mtime = get_time();
+    entry->ctime = entry->mtime = util::time();
 
     // Create new directory
     entry = make_entry(entry.get(), dir);
@@ -403,12 +374,12 @@ static int vram_symlink(const char* target, const char* path) {
 
     // Split path in parent directory and new symlink name
     string parent, name;
-    split_file_path(path, parent, name);
+    util::split_file_path(path, parent, name);
 
     // Check if parent directory exists
     err = index_find(parent, entry, entry_type::dir);
     if (err != 0) return err;
-    entry->ctime = entry->mtime = get_time();
+    entry->ctime = entry->mtime = util::time();
 
     // Create new symlink - target is only resolved at usage
     entry = make_entry(entry.get(), name);
@@ -473,12 +444,12 @@ static int vram_rename(const char* path, const char* new_path) {
 
     // Check if destination directory exists
     string dir, new_name;
-    split_file_path(new_path, dir, new_name);
+    util::split_file_path(new_path, dir, new_name);
 
     shared_ptr<entry_t> parent;
     err = index_find(dir, parent, entry_type::dir);
     if (err != 0) return err;
-    parent->ctime = parent->mtime = get_time();
+    parent->ctime = parent->mtime = util::time();
 
     // If the destination entry already exists, then delete it
     shared_ptr<entry_t> dest_entry;
@@ -487,7 +458,7 @@ static int vram_rename(const char* path, const char* new_path) {
 
     move_entry(entry, parent.get(), new_name);
 
-    entry->ctime = get_time();
+    entry->ctime = util::time();
 
     return 0;
 }
@@ -549,7 +520,7 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
         size -= read_size;
     }
 
-    session->entry->ctime = session->entry->atime = get_time();
+    session->entry->ctime = session->entry->atime = util::time();
 
     return total_read;
 }
@@ -594,7 +565,7 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
     if (session->entry->size < (size_t) off) {
         set_file_size(session->entry, off);
     }
-    session->entry->ctime = session->entry->mtime = get_time();
+    session->entry->ctime = session->entry->mtime = util::time();
 
     if (off < end_pos) {
         return -ENOSPC;
@@ -640,7 +611,7 @@ static int vram_truncate(const char* path, off_t size) {
     if (err != 0) return err;
 
     set_file_size(entry, size);
-    entry->ctime = entry->mtime = get_time();
+    entry->ctime = entry->mtime = util::time();
 
     return 0;
 }

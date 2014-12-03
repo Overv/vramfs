@@ -4,17 +4,6 @@
 #include <unistd.h>
 #include <sqlite3.h>
 
-#ifdef DEBUG
-// Use minimal OpenCL implementation for better debugging with valgrind
-#include "CL/debugcl.hpp"
-#elif OPENCL_1_1
-// OpenCL 1.1 header uses deprecated APIs
-#define CL_USE_DEPRECATED_OPENCL_1_1_APIS
-#include "CL/cl.hpp"
-#else
-#include <CL/cl.hpp>
-#endif
-
 // Standard library
 #include <iostream>
 #include <sstream>
@@ -27,8 +16,7 @@
 // Internal dependencies
 #include "types.hpp"
 
-// Nicely fits FUSE read/write size
-static const size_t BLOCK_SIZE = 128 * 1024;
+using namespace vram;
 
 static const int DEFAULT_FILE_MODE = 0664;
 static const int DEFAULT_DIR_MODE = 0775;
@@ -45,18 +33,8 @@ static std::mutex fslock;
 // File system root that links to the rest
 static shared_ptr<entry_t> root_entry;
 
-// OpenCL context, GPU device and prototype queue to create others from
-static cl::Context ocl_context;
-static cl::Device ocl_device;
-static cl::CommandQueue ocl_proto_queue;
-
 // File blocks
-static std::map<entry_off, cl::Buffer> file_blocks;
-
-#ifdef OPENCL_1_1
-// OpenCL buffer with zeros for initialisation instead of clEnqueueFillBuffer
-static cl::Buffer zero_buffer;
-#endif
+static std::map<entry_off, memory::block> file_blocks;
 
 /*
  * Helpers
@@ -93,7 +71,7 @@ static void split_file_path(const string& path, string& dir, string& file) {
 }
 
 // Get the OpenCL buffer of the block if it exists (returning true)
-static bool get_block(shared_ptr<entry_t> entry, off_t off, cl::Buffer& buf) {
+static bool get_block(shared_ptr<entry_t> entry, off_t off, memory::block& buf) {
     auto it = file_blocks.find(entry_off(entry, off));
 
     if (it != file_blocks.end()) {
@@ -105,30 +83,22 @@ static bool get_block(shared_ptr<entry_t> entry, off_t off, cl::Buffer& buf) {
 }
 
 // Allocate new block, buf is only set on success (returning true)
-static bool create_block(cl::CommandQueue& queue, shared_ptr<entry_t> entry, off_t off, cl::Buffer& buf) {
-    int r;
-    cl::Buffer ocl_buf(ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
-    if (r != CL_SUCCESS) return false;
+static bool create_block(shared_ptr<entry_t> entry, off_t off, memory::block& buf) {
+    bool success;
+    memory::block tmp_buf(success);
 
-    // Initialise with zeros (out-of-memory error usually occurs at this point)
-#ifdef OPENCL_1_1
-    r = queue.enqueueCopyBuffer(zero_buffer, ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
-    if (r != CL_SUCCESS) return false;
-#else
-    r = queue.enqueueFillBuffer(ocl_buf, 0, 0, BLOCK_SIZE, nullptr, nullptr);
-    if (r != CL_SUCCESS) return false;
-#endif
+    if (success) {
+        file_blocks[entry_off(entry, off)] = tmp_buf;
+        buf = tmp_buf;
+    }
 
-    file_blocks[entry_off(entry, off)] = ocl_buf;
-    buf = ocl_buf;
-
-    return true;
+    return success;
 }
 
 // Delete all blocks with a starting offset >= *off*
 static void delete_blocks(shared_ptr<entry_t> entry, off_t off = 0) {
     // Determine lowest block within range
-    off_t start_off = (off / BLOCK_SIZE) * BLOCK_SIZE;
+    off_t start_off = (off / memory::block::size) * memory::block::size;
 
     for (auto it = file_blocks.find(entry_off(entry, start_off)); it != file_blocks.end();) {
         if (it->first.entry == entry && it->first.off >= off) {
@@ -242,34 +212,12 @@ static void* vram_init(fuse_conn_info* conn) {
     root_entry = make_entry(nullptr, "");
     root_entry->dir = true;
 
-    // Create OpenCL context
-    std::vector<cl::Platform> platforms;
-    cl::Platform::get(&platforms);
-    if (platforms.size() == 0) return fatal_error("no opencl platform found", nullptr);
-
-    // Search platforms for GPU devices
-    for (auto& platform : platforms) {
-        std::vector<cl::Device> gpu_devices;
-        platform.getDevices(CL_DEVICE_TYPE_GPU, &gpu_devices);
-        if (gpu_devices.size() == 0) continue;
-
-        ocl_device = gpu_devices[0];
-        ocl_context = cl::Context(gpu_devices);
-        ocl_proto_queue = cl::CommandQueue(ocl_context, ocl_device);
-
-#ifdef OPENCL_1_1
-        char zero_data[BLOCK_SIZE] = {};
-        int r;
-        zero_buffer = cl::Buffer(ocl_context, CL_MEM_READ_WRITE, BLOCK_SIZE, nullptr, &r);
-        if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", nullptr);
-        r = ocl_proto_queue.enqueueWriteBuffer(zero_buffer, true, 0, BLOCK_SIZE, zero_data, nullptr, nullptr);
-        if (r != CL_SUCCESS) return fatal_error("failed to allocate opencl buffer", nullptr);
-#endif
-
-        return nullptr;
+    // Check for OpenCL supported GPU
+    if (!memory::is_available()) {
+        return fatal_error("no opencl capable gpu found", nullptr);
     }
 
-    return fatal_error("no opencl capable gpu found", nullptr);
+    return nullptr;
 }
 
 /*
@@ -408,7 +356,7 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     entry->size = 0;
 
     // Open it by assigning new file handle
-    fi->fh = reinterpret_cast<uint64_t>(new file_session(entry, ocl_proto_queue));
+    fi->fh = reinterpret_cast<uint64_t>(new file_session(entry));
 
     return 0;
 }
@@ -555,7 +503,7 @@ static int vram_open(const char* path, fuse_file_info* fi) {
     int err = index_find(path, entry, entry_type::file);
     if (err != 0) return err;
 
-    fi->fh = reinterpret_cast<uint64_t>(new file_session(entry, ocl_proto_queue));
+    fi->fh = reinterpret_cast<uint64_t>(new file_session(entry));
 
     return 0;
 }
@@ -572,28 +520,24 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
     if ((size_t) off >= file_size) return 0;
     size = std::min(file_size - off, size);
 
-    if (session->dirty) {
-        session->queue.finish();
-        session->dirty = false;
-    }
-
     // Walk over blocks in read region
     off_t end_pos = off + size;
     size_t total_read = size;
 
     while (off < end_pos) {
         // Find block corresponding to current offset
-        off_t block_start = (off / BLOCK_SIZE) * BLOCK_SIZE;
+        off_t block_start = (off / memory::block::size) * memory::block::size;
         off_t block_off = off - block_start;
-        size_t read_size = std::min(BLOCK_SIZE - block_off, size);
+        size_t read_size = std::min(memory::block::size - block_off, size);
 
-        cl::Buffer ocl_buf;
-        bool buf_exists = get_block(session->entry, block_start, ocl_buf);
+        memory::block block;
+        bool block_exists = get_block(session->entry, block_start, block);
 
         // Allow multiple threads to block for reading simultaneously
         fslock.unlock();
-        if (buf_exists) {
-            session->queue.enqueueReadBuffer(ocl_buf, true, block_off, read_size, buf, nullptr, nullptr);
+        if (block_exists) {
+            //session->queue.enqueueReadBuffer(block, true, block_off, read_size, buf, nullptr, nullptr);
+            block.read(block_off, read_size, buf);
         } else {
             // Non-written part of file
             memset(buf, 0, read_size);
@@ -614,10 +558,6 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
  * Write file
  */
 
-static CL_CALLBACK void write_cb(cl_event ev, cl_int status, void* buf_copy) {
-    delete [] reinterpret_cast<char*>(buf_copy);
-}
-
 static int vram_write(const char* path, const char* buf, size_t size, off_t off, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
     file_session* session = reinterpret_cast<file_session*>(fi->fh);
@@ -628,29 +568,23 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
 
     while (off < end_pos) {
         // Find block corresponding to current offset
-        off_t block_start = (off / BLOCK_SIZE) * BLOCK_SIZE;
+        off_t block_start = (off / memory::block::size) * memory::block::size;
         off_t block_off = off - block_start;
-        size_t write_size = std::min(BLOCK_SIZE - block_off, size);
+        size_t write_size = std::min(memory::block::size - block_off, size);
 
-        cl::Buffer ocl_buf;
-        bool buf_exists = get_block(session->entry, block_start, ocl_buf);
+        memory::block block;
+        bool block_exists = get_block(session->entry, block_start, block);
 
-        if (!buf_exists) {
-            buf_exists = create_block(session->queue, session->entry, block_start, ocl_buf);
+        if (!block_exists) {
+            block_exists = create_block(session->entry, block_start, block);
 
             // Failed to allocate buffer, likely out of VRAM
-            if (!buf_exists) break;
+            if (!block_exists) break;
         }
 
-        // Make copy of buffer for OpenCL to do asynchronous write
-        char* buf_copy = new char[write_size];
-        memcpy(buf_copy, buf, write_size);
+        block.write(block_off, write_size, buf, true);
 
-        cl::Event event;
-        session->queue.enqueueWriteBuffer(ocl_buf, false, block_off, write_size, buf_copy, nullptr, &event);
-
-        // Callback on completion to clean up the buffer copy
-        event.setCallback(CL_COMPLETE, write_cb, buf_copy);
+        session->last_written_block = block;
 
         buf += write_size;
         off += write_size;
@@ -661,8 +595,6 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
         set_file_size(session->entry, off);
     }
     session->entry->ctime = session->entry->mtime = get_time();
-
-    session->dirty = true;
 
     if (off < end_pos) {
         return -ENOSPC;
@@ -679,7 +611,7 @@ static int vram_fsync(const char* path, int, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
 
     file_session* session = reinterpret_cast<file_session*>(fi->fh);
-    session->queue.finish();
+    session->last_written_block.sync();
 
     return 0;
 }
@@ -691,9 +623,7 @@ static int vram_fsync(const char* path, int, fuse_file_info* fi) {
 static int vram_release(const char* path, fuse_file_info* fi) {
     scoped_lock local_lock(fslock);
 
-    file_session* session = reinterpret_cast<file_session*>(fi->fh);
-    session->queue.finish();
-    delete session;
+    delete reinterpret_cast<file_session*>(fi->fh);
 
     return 0;
 }

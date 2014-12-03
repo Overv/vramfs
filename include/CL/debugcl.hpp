@@ -58,40 +58,40 @@ namespace cl {
         std::shared_ptr<std::vector<char>> data;
     };
 
+    class Event {
+    public:
+        void setCallback(int flag, callback_fn cb, void* userdata) {
+            cb(0, 0, userdata);
+        }
+    };
+
     class CommandQueue {
     public:
         CommandQueue() {}
         CommandQueue(Context& ctx, Device& device) {}
 
-        int enqueueFillBuffer(Buffer& buf, int pattern, int off, int size, void* events, void* event) {
+        int enqueueFillBuffer(Buffer& buf, int pattern, int off, int size, std::vector<cl::Event>* events, cl::Event* event) {
             memset(&buf.data->operator[](off), 0, size);
             return CL_SUCCESS;
         }
 
-        int enqueueCopyBuffer(Buffer& src, Buffer& dst, int offSrc, int offDst, int size, void* events, void* event) {
+        int enqueueCopyBuffer(Buffer& src, Buffer& dst, int offSrc, int offDst, int size, std::vector<cl::Event>* events, cl::Event* event) {
             memcpy(&dst.data->operator[](offDst), &src.data->operator[](offSrc), size);
             return CL_SUCCESS;
         }
 
-        int enqueueReadBuffer(Buffer& buf, bool block, int off, int size, char* out, void* events, void* event) {
+        int enqueueReadBuffer(Buffer& buf, bool block, int off, int size, void* out, std::vector<cl::Event>* events, cl::Event* event) {
             memcpy(out, &buf.data->operator[](off), size);
             return CL_SUCCESS;
         }
 
-        int enqueueWriteBuffer(Buffer& buf, bool block, int off, int size, const char* in, void* events, void* event) {
+        int enqueueWriteBuffer(Buffer& buf, bool block, int off, int size, const void* in, std::vector<cl::Event>* events, cl::Event* event) {
             memcpy(&buf.data->operator[](off), in, size);
             return CL_SUCCESS;
         }
 
         int finish() {
             return CL_SUCCESS;
-        }
-    };
-
-    class Event {
-    public:
-        void setCallback(int flag, callback_fn cb, void* userdata) {
-            cb(0, 0, userdata);
         }
     };
 }

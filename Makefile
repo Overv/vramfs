@@ -1,5 +1,6 @@
 CC = g++
-CFLAGS = -march=native -O2 -flto -Wall -Werror -std=c++11
+CFLAGS = -march=native -O2 -flto -Wall -Werror -std=c++11 `pkg-config fuse --cflags` -I include/
+LDFLAGS = `pkg-config fuse --libs` -l OpenCL
 
 ifeq ($(DEBUG), 1)
 	CFLAGS += -g -DDEBUG
@@ -9,9 +10,13 @@ ifeq ($(OPENCL_1_1), 1)
 	CFLAGS += -DOPENCL_1_1
 endif
 
-vramfs: vramfs.cpp types.hpp
-	$(CC) $(CFLAGS) -o vramfs vramfs.cpp `pkg-config fuse --cflags --libs` -l OpenCL
+bin/vramfs: bin/vramfs.o bin/memory.o
+	$(CC) -o bin/vramfs bin/*.o $(LDFLAGS)
+
+bin/%.o: src/%.cpp
+	@mkdir -p bin
+	$(CC) $(CFLAGS) -c -o $@ $<
 
 .PHONY: clean
 clean:
-	rm -f vramfs
+	rm -rf bin/

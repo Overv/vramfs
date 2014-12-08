@@ -40,7 +40,6 @@ namespace vram {
 
     struct file_session {
         entry::entry_ref entry;
-        memory::block last_written_block;
 
         file_session(entry::entry_ref entry) : entry(entry) {}
     };

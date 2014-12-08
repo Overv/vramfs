@@ -7,6 +7,7 @@
 
 #include <string>
 #include <memory>
+#include <mutex>
 #include <map>
 #include <unordered_map>
 
@@ -51,10 +52,6 @@ namespace vram {
             // Target if this entry is a symlink
             string target;
 
-            // Data blocks if this entry is a file
-            // TODO: Make all block related fields/methods private and expose only read() / write()
-            std::map<off_t, memory::block> file_blocks;
-
             entry_t(const entry_t& other) = delete;
 
             // Constructor that takes care of memory management
@@ -65,15 +62,6 @@ namespace vram {
             // Blocks beyond the new file size are immediately deallocated
             void size(size_t new_size);
 
-            // Get the OpenCL buffer of the block if it exists (returning true)
-            bool get_block(off_t off, memory::block& buf) const;
-
-            // Allocate new block, buf is only set on success (returning true)
-            bool create_block(off_t off, memory::block& buf);
-
-            // Delete all blocks with a starting offset >= *off*
-            void delete_blocks(off_t off = 0);
-
             // Find entry by path relative to this entry
             int find(const string& path, entry_ref& entry, int filter = type::all);
 
@@ -83,6 +71,18 @@ namespace vram {
             // Move entry
             void move(entry_ptr new_parent, const string& new_name);
 
+            // Read data from file, returns total bytes read <= size
+            //
+            // The specified mutex is unlocked while blocking to read, because
+            // that's a non-critical section.
+            int read(off_t off, size_t size, char* data, std::mutex& wait_mutex);
+
+            // Write data to file, returns -error or total bytes written
+            int write(off_t off, size_t size, const char* data, bool async = true);
+
+            // Sync writes to file
+            void sync();
+
         private:
             // Default directory size
             size_t _size = 4096;
@@ -90,7 +90,22 @@ namespace vram {
             // Reference to itself created in make()
             std::weak_ptr<entry_t> self_ref;
 
+            // Data blocks if this entry is a file
+            std::map<off_t, memory::block> file_blocks;
+
+            // Last block touched by write()
+            memory::block last_written_block;
+
             entry_t();
+
+            // Get the OpenCL buffer of the block if it exists (returning true)
+            bool get_block(off_t off, memory::block& buf) const;
+
+            // Allocate new block, buf is only set on success (returning true)
+            bool create_block(off_t off, memory::block& buf);
+
+            // Delete all blocks with a starting offset >= *off*
+            void delete_blocks(off_t off = 0);
         };
     }
 }

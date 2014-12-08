@@ -343,41 +343,7 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
     lock_guard<mutex> local_lock(fsmutex);
     file_session* session = reinterpret_cast<file_session*>(fi->fh);
 
-    size_t file_size = session->entry->size();
-    if ((size_t) off >= file_size) return 0;
-    size = std::min(file_size - off, size);
-
-    // Walk over blocks in read region
-    off_t end_pos = off + size;
-    size_t total_read = size;
-
-    while (off < end_pos) {
-        // Find block corresponding to current offset
-        off_t block_start = (off / memory::block::size) * memory::block::size;
-        off_t block_off = off - block_start;
-        size_t read_size = std::min(memory::block::size - block_off, size);
-
-        memory::block block;
-        bool block_exists = session->entry->get_block(block_start, block);
-
-        // Allow multiple threads to block for reading simultaneously
-        fsmutex.unlock();
-        if (block_exists) {
-            block.read(block_off, read_size, buf);
-        } else {
-            // Non-written part of file
-            memset(buf, 0, read_size);
-        }
-        fsmutex.lock();
-
-        buf += read_size;
-        off += read_size;
-        size -= read_size;
-    }
-
-    session->entry->ctime = session->entry->atime = util::time();
-
-    return total_read;
+    return session->entry->read(off, size, buf, fsmutex);
 }
 
 /*
@@ -388,45 +354,7 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
     lock_guard<mutex> local_lock(fsmutex);
     file_session* session = reinterpret_cast<file_session*>(fi->fh);
 
-    // Walk over blocks in write region
-    off_t end_pos = off + size;
-    size_t total_write = size;
-
-    while (off < end_pos) {
-        // Find block corresponding to current offset
-        off_t block_start = (off / memory::block::size) * memory::block::size;
-        off_t block_off = off - block_start;
-        size_t write_size = std::min(memory::block::size - block_off, size);
-
-        memory::block block;
-        bool block_exists = session->entry->get_block(block_start, block);
-
-        if (!block_exists) {
-            block_exists = session->entry->create_block(block_start, block);
-
-            // Failed to allocate buffer, likely out of VRAM
-            if (!block_exists) break;
-        }
-
-        block.write(block_off, write_size, buf, true);
-
-        session->last_written_block = block;
-
-        buf += write_size;
-        off += write_size;
-        size -= write_size;
-    }
-
-    if (session->entry->size() < (size_t) off) {
-        session->entry->size(off);
-    }
-    session->entry->ctime = session->entry->mtime = util::time();
-
-    if (off < end_pos) {
-        return -ENOSPC;
-    } else {
-        return total_write;
-    }
+    return session->entry->write(off, size, buf);
 }
 
 /*
@@ -437,7 +365,7 @@ static int vram_fsync(const char* path, int, fuse_file_info* fi) {
     lock_guard<mutex> local_lock(fsmutex);
 
     file_session* session = reinterpret_cast<file_session*>(fi->fh);
-    session->last_written_block.sync();
+    session->entry->sync();
 
     return 0;
 }

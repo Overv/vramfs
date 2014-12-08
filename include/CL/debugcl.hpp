@@ -63,6 +63,8 @@ namespace cl {
         void setCallback(int flag, callback_fn cb, void* userdata) {
             cb(0, 0, userdata);
         }
+
+        void wait() {}
     };
 
     class CommandQueue {
@@ -70,22 +72,22 @@ namespace cl {
         CommandQueue() {}
         CommandQueue(Context& ctx, Device& device) {}
 
-        int enqueueFillBuffer(Buffer& buf, int pattern, int off, int size, std::vector<cl::Event>* events, cl::Event* event) {
+        int enqueueFillBuffer(const Buffer& buf, int pattern, int off, int size, std::vector<cl::Event>* events, cl::Event* event) {
             memset(&buf.data->operator[](off), 0, size);
             return CL_SUCCESS;
         }
 
-        int enqueueCopyBuffer(Buffer& src, Buffer& dst, int offSrc, int offDst, int size, std::vector<cl::Event>* events, cl::Event* event) {
+        int enqueueCopyBuffer(const Buffer& src, Buffer& dst, int offSrc, int offDst, int size, std::vector<cl::Event>* events, cl::Event* event) {
             memcpy(&dst.data->operator[](offDst), &src.data->operator[](offSrc), size);
             return CL_SUCCESS;
         }
 
-        int enqueueReadBuffer(Buffer& buf, bool block, int off, int size, void* out, std::vector<cl::Event>* events, cl::Event* event) {
+        int enqueueReadBuffer(const Buffer& buf, bool block, int off, int size, void* out, std::vector<cl::Event>* events, cl::Event* event) {
             memcpy(out, &buf.data->operator[](off), size);
             return CL_SUCCESS;
         }
 
-        int enqueueWriteBuffer(Buffer& buf, bool block, int off, int size, const void* in, std::vector<cl::Event>* events, cl::Event* event) {
+        int enqueueWriteBuffer(const Buffer& buf, bool block, int off, int size, const void* in, std::vector<cl::Event>* events, cl::Event* event) {
             memcpy(&buf.data->operator[](off), in, size);
             return CL_SUCCESS;
         }

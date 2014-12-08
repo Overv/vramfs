@@ -38,7 +38,7 @@ namespace vram {
 
             block(bool& success);
 
-            void read(off_t offset, size_t size, void* data);
+            void read(off_t offset, size_t size, void* data) const;
 
             // Data is internally copied if called with async = true
             void write(off_t offset, size_t size, const void* data, bool async = false);

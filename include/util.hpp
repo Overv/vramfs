@@ -5,6 +5,14 @@
  * Utility functions
  */
 
+#define FUSE_USE_VERSION 26
+#include <fuse.h>
+
+#include <iostream>
+#include <string>
+
+using std::string;
+
 namespace vram {
     namespace util {
         // Error function that can be combined with a return statement to return *ret*
@@ -16,26 +24,10 @@ namespace vram {
         }
 
         // Get current time with nanosecond precision
-        timespec time() {
-            timespec tv;
-            clock_gettime(CLOCK_REALTIME_COARSE, &tv);
-            return tv;
-        }
+        timespec time();
 
         // Split path/to/file.txt into "path/to" and "file.txt"
-        void split_file_path(const string& path, string& dir, string& file) {
-            size_t p = path.rfind("/");
-
-            if (p == string::npos) {
-                dir = "";
-                file = path;
-            } else {
-                dir = path.substr(0, p);
-                file = path.substr(p + 1);
-            }
-
-            if (dir.size() == 0) dir = "/";
-        }
+        void split_file_path(const string& path, string& dir, string& file);
     }
 }
 

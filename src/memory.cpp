@@ -70,7 +70,7 @@ namespace vram {
             success = r == CL_SUCCESS;
         }
 
-        void block::read(off_t offset, size_t size, void* data) {
+        void block::read(off_t offset, size_t size, void* data) const {
             // Queue is configured for in-order execution, so writes before this
             // are guaranteed to be completed first
             queue.enqueueReadBuffer(buffer, true, offset, size, data, nullptr, nullptr);

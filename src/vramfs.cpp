@@ -9,13 +9,9 @@
 #include <cstdint>
 
 // Internal dependencies
-#include "types.hpp"
-#include "util.hpp"
+#include "vramfs.hpp"
 
 using namespace vram;
-
-static const int DEFAULT_FILE_MODE = 0664;
-static const int DEFAULT_DIR_MODE = 0775;
 
 /*
  * Globals
@@ -27,7 +23,7 @@ static const int DEFAULT_DIR_MODE = 0775;
 static std::mutex fsmutex;
 
 // File system root that links to the rest
-static entry::entry_ref root_entry;
+static entry::dir_ref root_entry;
 
 /*
  * Initialisation
@@ -35,8 +31,7 @@ static entry::entry_ref root_entry;
 
 static void* vram_init(fuse_conn_info* conn) {
     // Create root directory
-    root_entry = entry::entry_t::make(nullptr, "");
-    root_entry->dir = true;
+    root_entry = entry::dir_t::make(nullptr, "");
 
     // Check for OpenCL supported GPU
     if (!memory::is_available()) {
@@ -60,10 +55,10 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
 
     memset(stbuf, 0, sizeof(struct stat));
 
-    if (entry->dir) {
+    if (entry->type() == entry::type::dir) {
         stbuf->st_mode = S_IFDIR | entry->mode;
         stbuf->st_nlink = 2;
-    } else if (entry->target.size() == 0) {
+    } else if (entry->type() == entry::type::file) {
         stbuf->st_mode = S_IFREG | entry->mode;
         stbuf->st_nlink = 1;
     } else {
@@ -89,10 +84,11 @@ static int vram_readlink(const char* path, char* buf, size_t size) {
     lock_guard<mutex> local_lock(fsmutex);
 
     entry::entry_ref entry;
-    int err = root_entry->find(path, entry, entry::type::link);
+    int err = root_entry->find(path, entry, entry::type::symlink);
     if (err != 0) return err;
 
-    strncpy(buf, entry->target.c_str(), size);
+    auto symlink = dynamic_pointer_cast<entry::symlink_t>(entry);
+    strncpy(buf, symlink->target.c_str(), size);
 
     return 0;
 }
@@ -143,16 +139,17 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
     entry::entry_ref entry;
     int err = root_entry->find(path, entry, entry::type::dir);
     if (err != 0) return err;
+    auto dir = dynamic_pointer_cast<entry::dir_t>(entry);
 
     // Required default entries
     filler(buf, ".", nullptr, 0);
     filler(buf, "..", nullptr, 0);
 
-    for (auto& pair : entry->children) {
+    for (auto& pair : dir->children) {
         filler(buf, pair.second->name.c_str(), nullptr, 0);
     }
 
-    entry->ctime = entry->atime = util::time();
+    dir->ctime = dir->atime = util::time();
 
     return 0;
 }
@@ -170,20 +167,18 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     if (err == -EISDIR) return err;
     else if (err == 0) entry->unlink();
 
-    string dir, file;
-    util::split_file_path(path, dir, file);
+    string dir, name;
+    util::split_file_path(path, dir, name);
 
     // Check if parent directory exists
     err = root_entry->find(dir, entry, entry::type::dir);
     if (err != 0) return err;
-    entry->ctime = entry->mtime = util::time();
-
-    entry = entry::entry_t::make(entry.get(), file);
-    entry->mode = DEFAULT_FILE_MODE;
-    entry->size(0);
+    auto parent = dynamic_pointer_cast<entry::dir_t>(entry);
+    parent->ctime = parent->mtime = util::time();
 
     // Open it by assigning new file handle
-    fi->fh = reinterpret_cast<uint64_t>(new file_session(entry));
+    auto file = entry::file_t::make(parent.get(), name);
+    fi->fh = reinterpret_cast<uint64_t>(new file_session(file));
 
     return 0;
 }
@@ -200,18 +195,17 @@ static int vram_mkdir(const char* path, mode_t) {
     int err = root_entry->find(path, entry);
     if (err == 0) return -EEXIST;
 
-    string parent, dir;
-    util::split_file_path(path, parent, dir);
+    string dir, name;
+    util::split_file_path(path, dir, name);
 
     // Check if parent directory exists
-    err = root_entry->find(parent, entry, entry::type::dir);
+    err = root_entry->find(dir, entry, entry::type::dir);
     if (err != 0) return err;
-    entry->ctime = entry->mtime = util::time();
+    auto parent = dynamic_pointer_cast<entry::dir_t>(entry);
+    parent->ctime = parent->mtime = util::time(); util::time();
 
     // Create new directory
-    entry = entry::entry_t::make(entry.get(), dir);
-    entry->dir = true;
-    entry->mode = DEFAULT_DIR_MODE;
+    entry::dir_t::make(parent.get(), name);
 
     return 0;
 }
@@ -229,18 +223,17 @@ static int vram_symlink(const char* target, const char* path) {
     if (err == 0) return -EEXIST;
 
     // Split path in parent directory and new symlink name
-    string parent, name;
-    util::split_file_path(path, parent, name);
+    string dir, name;
+    util::split_file_path(path, dir, name);
 
     // Check if parent directory exists
-    err = root_entry->find(parent, entry, entry::type::dir);
+    err = root_entry->find(dir, entry, entry::type::dir);
     if (err != 0) return err;
-    entry->ctime = entry->mtime = util::time();
+    auto parent = dynamic_pointer_cast<entry::dir_t>(entry);
+    parent->ctime = parent->mtime = util::time(); util::time();
 
     // Create new symlink - target is only resolved at usage
-    entry = entry::entry_t::make(entry.get(), name);
-    entry->target = target;
-    entry->size(entry->target.size());
+    entry::symlink_t::make(parent.get(), name, target);
 
     return 0;
 }
@@ -256,7 +249,7 @@ static int vram_unlink(const char* path) {
     lock_guard<mutex> local_lock(fsmutex);
 
     entry::entry_ref entry;
-    int err = root_entry->find(path, entry, entry::type::link | entry::type::file);
+    int err = root_entry->find(path, entry, entry::type::symlink | entry::type::file);
     if (err != 0) return err;
 
     entry->unlink();
@@ -275,13 +268,14 @@ static int vram_rmdir(const char* path) {
     entry::entry_ref entry;
     int err = root_entry->find(path, entry, entry::type::dir);
     if (err != 0) return err;
+    auto dir = dynamic_pointer_cast<entry::dir_t>(entry);
 
     // Check if directory is empty
-    if (entry->children.size() != 0) {
+    if (dir->children.size() != 0) {
         return -ENOTEMPTY;
     }
 
-    entry->unlink();
+    dir->unlink();
 
     return 0;
 }
@@ -302,9 +296,10 @@ static int vram_rename(const char* path, const char* new_path) {
     string dir, new_name;
     util::split_file_path(new_path, dir, new_name);
 
-    entry::entry_ref parent;
-    err = root_entry->find(dir, parent, entry::type::dir);
+    entry::entry_ref parent_entry;
+    err = root_entry->find(dir, parent_entry, entry::type::dir);
     if (err != 0) return err;
+    auto parent = dynamic_pointer_cast<entry::dir_t>(parent_entry);
     parent->ctime = parent->mtime = util::time();
 
     // If the destination entry already exists, then delete it
@@ -329,8 +324,9 @@ static int vram_open(const char* path, fuse_file_info* fi) {
     entry::entry_ref entry;
     int err = root_entry->find(path, entry, entry::type::file);
     if (err != 0) return err;
+    auto file = dynamic_pointer_cast<entry::file_t>(entry);
 
-    fi->fh = reinterpret_cast<uint64_t>(new file_session(entry));
+    fi->fh = reinterpret_cast<uint64_t>(new file_session(file));
 
     return 0;
 }
@@ -343,7 +339,7 @@ static int vram_read(const char* path, char* buf, size_t size, off_t off, fuse_f
     lock_guard<mutex> local_lock(fsmutex);
     file_session* session = reinterpret_cast<file_session*>(fi->fh);
 
-    return session->entry->read(off, size, buf, fsmutex);
+    return session->file->read(off, size, buf, fsmutex);
 }
 
 /*
@@ -354,7 +350,7 @@ static int vram_write(const char* path, const char* buf, size_t size, off_t off,
     lock_guard<mutex> local_lock(fsmutex);
     file_session* session = reinterpret_cast<file_session*>(fi->fh);
 
-    return session->entry->write(off, size, buf);
+    return session->file->write(off, size, buf);
 }
 
 /*
@@ -365,7 +361,7 @@ static int vram_fsync(const char* path, int, fuse_file_info* fi) {
     lock_guard<mutex> local_lock(fsmutex);
 
     file_session* session = reinterpret_cast<file_session*>(fi->fh);
-    session->entry->sync();
+    session->file->sync();
 
     return 0;
 }
@@ -392,9 +388,10 @@ static int vram_truncate(const char* path, off_t size) {
     entry::entry_ref entry;
     int err = root_entry->find(path, entry, entry::type::file);
     if (err != 0) return err;
+    auto file = dynamic_pointer_cast<entry::file_t>(entry);
 
-    entry->size(size);
-    entry->ctime = entry->mtime = util::time();
+    file->size(size);
+    file->ctime = file->mtime = util::time();
 
     return 0;
 }

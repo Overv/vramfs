@@ -12,7 +12,7 @@ ifeq ($(OPENCL_1_1), 1)
 	CFLAGS += -DOPENCL_1_1
 endif
 
-bin/vramfs: bin/util.o bin/memory.o bin/entry.o bin/vramfs.o
+bin/vramfs: bin/util.o bin/memory.o bin/entry.o bin/file.o bin/dir.o bin/symlink.o bin/vramfs.o
 	$(CC) -o bin/vramfs bin/*.o $(LDFLAGS)
 
 bin/%.o: src/%.cpp

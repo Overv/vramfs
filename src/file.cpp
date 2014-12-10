@@ -4,17 +4,8 @@
 namespace vram {
     namespace entry {
         file_ref file_t::make(dir_ptr parent, const string& name) {
-            auto file = std::make_shared<file_t>();
-
-            file->self_ref = file;
-
-            file->parent = parent;
-            file->name = name;
-
-            if (parent) {
-                parent->children[name] = file;
-            }
-
+            auto file = file_ref(new file_t());
+            file->link(parent, name);
             return file;
         }
 
@@ -70,7 +61,7 @@ namespace vram {
                 size -= read_size;
             }
 
-            ctime = atime = util::time();
+            atime(util::time());
 
             return total_read;
         }
@@ -108,7 +99,7 @@ namespace vram {
             if (_size < (size_t) off) {
                 _size = off;
             }
-            ctime = mtime = util::time();
+            mtime(util::time());
 
             if (off < end_pos) {
                 return -ENOSPC;

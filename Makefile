@@ -1,5 +1,5 @@
 CC = g++
-CFLAGS = -Wall -Werror -std=c++11 `pkg-config fuse --cflags` -I include/
+CFLAGS = -Wall -Wpedantic -Werror -std=c++11 `pkg-config fuse --cflags` -I include/
 LDFLAGS = `pkg-config fuse --libs` -l OpenCL
 
 ifeq ($(DEBUG), 1)

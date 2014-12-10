@@ -69,9 +69,9 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
     stbuf->st_uid = geteuid();
     stbuf->st_gid = getegid();
     stbuf->st_size = entry->size();
-    stbuf->st_atim = entry->atime;
-    stbuf->st_mtim = entry->mtime;
-    stbuf->st_ctim = entry->ctime;
+    stbuf->st_atim = entry->atime();
+    stbuf->st_mtim = entry->mtime();
+    stbuf->st_ctim = entry->ctime();
 
     return 0;
 }
@@ -105,7 +105,7 @@ static int vram_chmod(const char* path, mode_t mode) {
     if (err != 0) return err;
 
     entry->mode = mode;
-    entry->ctime = util::time();
+    entry->ctime(util::time());
 
     return 0;
 }
@@ -121,9 +121,8 @@ static int vram_utimens(const char* path, const timespec tv[2]) {
     int err = root_entry->find(path, entry, entry::type::file | entry::type::dir);
     if (err != 0) return err;
 
-    entry->atime = tv[0];
-    entry->mtime = tv[1];
-    entry->ctime = util::time();
+    entry->atime(tv[0]);
+    entry->mtime(tv[1]);
 
     return 0;
 }
@@ -145,11 +144,11 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
     filler(buf, ".", nullptr, 0);
     filler(buf, "..", nullptr, 0);
 
-    for (auto& pair : dir->children) {
+    for (auto& pair : dir->children()) {
         filler(buf, pair.second->name.c_str(), nullptr, 0);
     }
 
-    dir->ctime = dir->atime = util::time();
+    dir->atime(util::time());
 
     return 0;
 }
@@ -174,7 +173,7 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     err = root_entry->find(dir, entry, entry::type::dir);
     if (err != 0) return err;
     auto parent = dynamic_pointer_cast<entry::dir_t>(entry);
-    parent->ctime = parent->mtime = util::time();
+    parent->mtime(util::time());
 
     // Open it by assigning new file handle
     auto file = entry::file_t::make(parent.get(), name);
@@ -202,7 +201,7 @@ static int vram_mkdir(const char* path, mode_t) {
     err = root_entry->find(dir, entry, entry::type::dir);
     if (err != 0) return err;
     auto parent = dynamic_pointer_cast<entry::dir_t>(entry);
-    parent->ctime = parent->mtime = util::time(); util::time();
+    parent->mtime(util::time());
 
     // Create new directory
     entry::dir_t::make(parent.get(), name);
@@ -230,7 +229,7 @@ static int vram_symlink(const char* target, const char* path) {
     err = root_entry->find(dir, entry, entry::type::dir);
     if (err != 0) return err;
     auto parent = dynamic_pointer_cast<entry::dir_t>(entry);
-    parent->ctime = parent->mtime = util::time(); util::time();
+    parent->mtime(util::time());
 
     // Create new symlink - target is only resolved at usage
     entry::symlink_t::make(parent.get(), name, target);
@@ -240,9 +239,6 @@ static int vram_symlink(const char* target, const char* path) {
 
 /*
  * Delete file
- *
- * NOTE: FUSE will only call this function once the last handle to a file has
- * been closed. Setting the flag to disable that breaks the file system.
  */
 
 static int vram_unlink(const char* path) {
@@ -271,7 +267,7 @@ static int vram_rmdir(const char* path) {
     auto dir = dynamic_pointer_cast<entry::dir_t>(entry);
 
     // Check if directory is empty
-    if (dir->children.size() != 0) {
+    if (dir->children().size() != 0) {
         return -ENOTEMPTY;
     }
 
@@ -300,7 +296,7 @@ static int vram_rename(const char* path, const char* new_path) {
     err = root_entry->find(dir, parent_entry, entry::type::dir);
     if (err != 0) return err;
     auto parent = dynamic_pointer_cast<entry::dir_t>(parent_entry);
-    parent->ctime = parent->mtime = util::time();
+    parent->mtime(util::time());
 
     // If the destination entry already exists, then delete it
     entry::entry_ref dest_entry;
@@ -309,7 +305,7 @@ static int vram_rename(const char* path, const char* new_path) {
 
     entry->move(parent.get(), new_name);
 
-    entry->ctime = util::time();
+    entry->ctime(util::time());
 
     return 0;
 }
@@ -391,7 +387,7 @@ static int vram_truncate(const char* path, off_t size) {
     auto file = dynamic_pointer_cast<entry::file_t>(entry);
 
     file->size(size);
-    file->ctime = file->mtime = util::time();
+    file->mtime(util::time());
 
     return 0;
 }

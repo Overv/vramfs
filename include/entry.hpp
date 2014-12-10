@@ -12,8 +12,10 @@
 #include <unordered_map>
 
 #include "memory.hpp"
+#include "util.hpp"
 
 using std::string;
+using std::shared_ptr;
 
 namespace vram {
     namespace entry {
@@ -23,10 +25,10 @@ namespace vram {
         class dir_t;
         class symlink_t;
 
-        typedef std::shared_ptr<entry_t> entry_ref;
-        typedef std::shared_ptr<file_t> file_ref;
-        typedef std::shared_ptr<dir_t> dir_ref;
-        typedef std::shared_ptr<symlink_t> symlink_ref;
+        typedef shared_ptr<entry_t> entry_ref;
+        typedef shared_ptr<file_t> file_ref;
+        typedef shared_ptr<dir_t> dir_ref;
+        typedef shared_ptr<symlink_t> symlink_ref;
 
         typedef entry_t* entry_ptr;
         typedef file_t* file_ptr;
@@ -46,27 +48,30 @@ namespace vram {
         }
 
         // Full description of entry
-        // TODO: parent and children private?
-        class entry_t {
+        class entry_t : public std::enable_shared_from_this<entry_t> {
         public:
-            // Non-owning pointer, parent is guaranteed to exist if entry exists
-            dir_ptr parent = nullptr;
-
             string name;
 
             int mode = 0;
 
-            timespec atime;
-            timespec mtime;
-            timespec ctime;
-
             entry_t(const entry_t& other) = delete;
+
+            dir_ptr parent() const;
 
             virtual ~entry_t() {};
 
             virtual type::type_t type() const = 0;
 
             virtual size_t size() const = 0;
+
+            // Access or change times (automatically updates change time)
+            timespec atime() const;
+            timespec mtime() const;
+            timespec ctime() const;
+
+            void atime(timespec t);
+            void mtime(timespec t);
+            void ctime(timespec t);
 
             // Remove link with parent directory
             void unlink();
@@ -75,10 +80,18 @@ namespace vram {
             void move(dir_ptr new_parent, const string& new_name);
 
         protected:
-            // Reference to itself
-            std::weak_ptr<entry_t> self_ref;
-
             entry_t();
+
+            // Associate entry with a parent directory after construction
+            void link(dir_ptr parent, const string& name);
+
+        private:
+            // Non-owning pointer, parent is guaranteed to exist if entry exists
+            dir_ptr _parent = nullptr;
+
+            timespec _atime;
+            timespec _mtime;
+            timespec _ctime;
         };
 
         // File entry
@@ -86,8 +99,6 @@ namespace vram {
         public:
             // Constructor that takes care of memory management
             static file_ref make(dir_ptr parent, const string& name);
-
-            file_t();
 
             type::type_t type() const;
 
@@ -118,6 +129,8 @@ namespace vram {
             // File size
             size_t _size = 0;
 
+            file_t();
+
             // Get the OpenCL buffer of the block if it exists (returning true)
             bool get_block(off_t off, memory::block& buf) const;
 
@@ -130,28 +143,34 @@ namespace vram {
 
         // Directory entry
         class dir_t : public entry_t {
-        public:
-            std::unordered_map<string, entry_ref> children;
+            friend class entry_t;
 
+        public:
             // Constructor that takes care of memory management
             static dir_ref make(dir_ptr parent, const string& name);
-
-            dir_t();
 
             type::type_t type() const;
 
             // Always returns size of 4096
             size_t size() const;
 
+            const std::unordered_map<string, entry_ref> children() const;
+
             // Find entry by path relative to this entry
-            int find(const string& path, entry_ref& entry, int filter = type::all);
+            int find(const string& path, entry_ref& entry, int filter = type::all) const;
+
+        protected:
+            std::unordered_map<string, entry_ref> _children;
+
+        private:
+            dir_t();
         };
 
         // Symlink entry
         class symlink_t : public entry_t {
         public:
             // Target of symlink
-            string target;
+            const string target;
 
             // Constructor that takes care of memory management
             static symlink_ref make(dir_ptr parent, const string& name, const string& target);
@@ -159,6 +178,9 @@ namespace vram {
             type::type_t type() const;
 
             size_t size() const;
+
+        private:
+            symlink_t(const string& target);
         };
     }
 }

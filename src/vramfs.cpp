@@ -32,6 +32,8 @@ static entry::dir_ref root_entry;
 static void* vram_init(fuse_conn_info* conn) {
     // Create root directory
     root_entry = entry::dir_t::make(nullptr, "");
+    root_entry->user = geteuid();
+    root_entry->group = getegid();
 
     // Check for OpenCL supported GPU
     if (!memory::is_available()) {
@@ -61,13 +63,18 @@ static int vram_getattr(const char* path, struct stat* stbuf) {
     } else if (entry->type() == entry::type::file) {
         stbuf->st_mode = S_IFREG | entry->mode;
         stbuf->st_nlink = 1;
+        stbuf->st_blksize = memory::block::size;
+
+        if (entry->size() > 0) {
+            stbuf->st_blocks = 1 + (entry->size() - 1) / memory::block::size;
+        }
     } else {
         stbuf->st_mode = S_IFLNK | 0777;
         stbuf->st_nlink = 1;
     }
 
-    stbuf->st_uid = geteuid();
-    stbuf->st_gid = getegid();
+    stbuf->st_uid = entry->user;
+    stbuf->st_gid = entry->group;
     stbuf->st_size = entry->size();
     stbuf->st_atim = entry->atime();
     stbuf->st_mtim = entry->mtime();
@@ -105,6 +112,24 @@ static int vram_chmod(const char* path, mode_t mode) {
     if (err != 0) return err;
 
     entry->mode = mode;
+    entry->ctime(util::time());
+
+    return 0;
+}
+
+/*
+ * Change the owner/group of an entry
+ */
+
+static int vram_chown(const char* path, uid_t user, gid_t group) {
+    lock_guard<mutex> lock_lock(fsmutex);
+
+    entry::entry_ref entry;
+    int err = root_entry->find(path, entry, entry::type::file | entry::type::dir);
+    if (err != 0) return err;
+
+    entry->user = user;
+    entry->group = group;
     entry->ctime(util::time());
 
     return 0;
@@ -175,8 +200,14 @@ static int vram_create(const char* path, mode_t, struct fuse_file_info* fi) {
     auto parent = dynamic_pointer_cast<entry::dir_t>(entry);
     parent->mtime(util::time());
 
-    // Open it by assigning new file handle
+    // Create new entry with appropriate owner/group
     auto file = entry::file_t::make(parent.get(), name);
+
+    auto context = fuse_get_context();
+    file->user = context->uid;
+    file->group = context->gid;
+
+    // Open it by assigning new file handle
     fi->fh = reinterpret_cast<uint64_t>(new file_session(file));
 
     return 0;
@@ -203,8 +234,12 @@ static int vram_mkdir(const char* path, mode_t) {
     auto parent = dynamic_pointer_cast<entry::dir_t>(entry);
     parent->mtime(util::time());
 
-    // Create new directory
-    entry::dir_t::make(parent.get(), name);
+    // Create new directory with appropriate owner/group
+    auto new_dir = entry::dir_t::make(parent.get(), name);
+
+    auto context = fuse_get_context();
+    new_dir->user = context->uid;
+    new_dir->group = context->gid;
 
     return 0;
 }
@@ -231,8 +266,12 @@ static int vram_symlink(const char* target, const char* path) {
     auto parent = dynamic_pointer_cast<entry::dir_t>(entry);
     parent->mtime(util::time());
 
-    // Create new symlink - target is only resolved at usage
-    entry::symlink_t::make(parent.get(), name, target);
+    // Create new symlink with appropriate owner/group
+    auto symlink = entry::symlink_t::make(parent.get(), name, target);
+
+    auto context = fuse_get_context();
+    symlink->user = context->uid;
+    symlink->group = context->gid;
 
     return 0;
 }
@@ -403,6 +442,7 @@ static struct vram_operations : fuse_operations {
         readlink = vram_readlink;
         utimens = vram_utimens;
         chmod = vram_chmod;
+        chown = vram_chown;
         readdir = vram_readdir;
         create = vram_create;
         mkdir = vram_mkdir;

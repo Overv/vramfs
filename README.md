@@ -30,7 +30,6 @@ Future ideas
 ------------
 
 - Implement RAID-0 for SLI/Crossfire setups
-- Take into account file mode bits
 
 License
 -------

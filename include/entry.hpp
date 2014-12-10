@@ -52,7 +52,9 @@ namespace vram {
         public:
             string name;
 
-            int mode = 0;
+            mode_t mode = 0;
+            uid_t user = 0;
+            gid_t group = 0;
 
             entry_t(const entry_t& other) = delete;
 

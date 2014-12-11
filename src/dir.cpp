@@ -12,7 +12,7 @@ namespace vram {
         }
 
         dir_t::dir_t() {
-            mode = 0755;
+            mode(0755);
         }
 
         type::type_t dir_t::type() const {
@@ -23,7 +23,9 @@ namespace vram {
             return 4096;
         }
 
-        const std::unordered_map<string, entry_ref> dir_t::children() const {
+        const std::unordered_map<string, entry_ref> dir_t::children() {
+            atime(util::time());
+
             return _children;
         }
 

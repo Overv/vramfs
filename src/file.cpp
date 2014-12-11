@@ -10,7 +10,7 @@ namespace vram {
         }
 
         file_t::file_t() {
-            mode = 0644;
+            mode(0644);
         }
 
         type::type_t file_t::type() const {
@@ -27,6 +27,8 @@ namespace vram {
             }
 
             _size = new_size;
+
+            mtime(util::time());
         }
 
         int file_t::read(off_t off, size_t size, char* data, std::mutex& wait_mutex) {

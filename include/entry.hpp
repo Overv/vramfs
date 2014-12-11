@@ -50,15 +50,11 @@ namespace vram {
         // Full description of entry
         class entry_t : public std::enable_shared_from_this<entry_t> {
         public:
-            string name;
-
-            mode_t mode = 0;
-            uid_t user = 0;
-            gid_t group = 0;
-
             entry_t(const entry_t& other) = delete;
 
             dir_ptr parent() const;
+
+            const string& name() const;
 
             virtual ~entry_t() {};
 
@@ -66,14 +62,22 @@ namespace vram {
 
             virtual size_t size() const = 0;
 
-            // Access or change times (automatically updates change time)
+            // Change file attributes (automatically updates change time)
             timespec atime() const;
             timespec mtime() const;
             timespec ctime() const;
 
+            mode_t mode() const;
+            uid_t user() const;
+            gid_t group() const;
+
             void atime(timespec t);
             void mtime(timespec t);
             void ctime(timespec t);
+
+            void mode(mode_t mode);
+            void user(uid_t user);
+            void group(gid_t group);
 
             // Remove link with parent directory
             void unlink();
@@ -90,6 +94,12 @@ namespace vram {
         private:
             // Non-owning pointer, parent is guaranteed to exist if entry exists
             dir_ptr _parent = nullptr;
+
+            string _name;
+
+            mode_t _mode = 0;
+            uid_t _user = 0;
+            gid_t _group = 0;
 
             timespec _atime;
             timespec _mtime;
@@ -156,7 +166,8 @@ namespace vram {
             // Always returns size of 4096
             size_t size() const;
 
-            const std::unordered_map<string, entry_ref> children() const;
+            // Not const, because it changes access time
+            const std::unordered_map<string, entry_ref> children();
 
             // Find entry by path relative to this entry
             int find(const string& path, entry_ref& entry, int filter = type::all) const;

@@ -36,6 +36,8 @@ static void* vram_init(fuse_conn_info* conn) {
     root_entry->user(geteuid());
     root_entry->group(getegid());
 
+    std::cout << "mounted." << std::endl;
+
     return nullptr;
 }
 
@@ -535,6 +537,9 @@ int main(int argc, char* argv[]) {
 
     // Let FUSE and the kernel deal with permissions handling
     fuse_opt_add_arg(&args, "-odefault_permissions");
+
+    // OpenCL driver acts funky if program doesn't keep running in foreground
+    fuse_opt_add_arg(&args, "-f");
 
     return fuse_main(args.argc, args.argv, &operations, nullptr);
 }

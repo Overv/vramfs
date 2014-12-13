@@ -46,7 +46,7 @@ namespace vram {
 
         public:
             // Best performance/size balance
-            static const size_t size = 64 * 1024;
+            static const size_t size = 128 * 1024;
 
             block(const block& other) = delete;
 

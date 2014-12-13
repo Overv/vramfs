@@ -8,17 +8,12 @@
 #include <cstring>
 #include <cstdint>
 #include <limits>
+#include <regex>
 
 // Internal dependencies
 #include "vramfs.hpp"
 
 using namespace vram;
-
-/*
- * Configuration
- */
-
-const size_t disk_size = 2L * 1024L * 1024L * 1024L;
 
 /*
  * Globals
@@ -37,17 +32,9 @@ static entry::dir_ref root_entry;
  */
 
 static void* vram_init(fuse_conn_info* conn) {
-    // Create root directory
     root_entry = entry::dir_t::make(nullptr, "");
     root_entry->user(geteuid());
     root_entry->group(getegid());
-
-    // Check for OpenCL supported GPU
-    if (!memory::is_available()) {
-        return util::fatal_error("no opencl capable gpu found", nullptr);
-    } else {
-        memory::increase_pool(disk_size);
-    }
 
     return nullptr;
 }
@@ -474,6 +461,80 @@ static struct vram_operations : fuse_operations {
     }
 } operations;
 
+static int print_help() {
+    std::cerr <<
+        "usage: vramfs <mountdir> <size> [-f]\n\n"
+        "  mountdir - directory to mount file system, must be empty\n"
+        "  size     - size of the disk in bytes\n"
+        "  -f       - flag that forces mounting, with a smaller size if needed\n\n"
+        "The size may be followed by one of the following multiplicative suffixes: "
+        "K=1024, KB=1000, M=1024*1024, MB=1000*1000, G=1024*1024*1024, GB=1000*1000*1000. "
+        "It's rounded up to the nearest multiple of the block size."
+    << std::endl;
+
+    return 1;
+}
+
+static std::regex size_regex("^([0-9]+)([KMG]B?)?$");
+
+static size_t parse_size(const string& param) {
+    std::smatch groups;
+    std::regex_search(param, groups, size_regex);
+
+    size_t size = std::stoul(groups[1]);
+
+    if (groups[2] == "K") size *= 1024UL;
+    else if (groups[2] == "KB") size *= 1000UL;
+    else if (groups[2] == "M") size *= 1024UL * 1024UL;
+    else if (groups[2] == "MB") size *= 1000UL * 1000UL;
+    else if (groups[2] == "G") size *= 1024UL * 1024UL * 1024UL;
+    else if (groups[2] == "GB") size *= 1000UL * 1000UL * 1000UL;
+
+    return size;
+}
+
 int main(int argc, char* argv[]) {
-    return fuse_main(argc, argv, &operations, nullptr);
+    // Check parameter and parse parameters
+    if (argc != 3 && argc != 4) return print_help();
+    if (!std::regex_match(argv[2], size_regex)) return print_help();
+    if (argc == 4 && strcmp(argv[3], "-f") != 0) return print_help();
+
+    size_t disk_size = parse_size(argv[2]);
+    bool force_allocate = argc == 4;
+
+    // Check for OpenCL supported GPU and allocate memory
+    if (!memory::is_available()) {
+        std::cerr << "no opencl capable gpu found" << std::endl;
+        return 1;
+    } else {
+        std::cout << "allocating vram..." << std::endl;
+
+        size_t actual_size = memory::increase_pool(disk_size);
+
+        if (actual_size < disk_size) {
+            if (force_allocate) {
+                std::cerr << "warning: only allocated " << actual_size << " bytes" << std::endl;
+            } else {
+                std::cerr << "error: could not allocate more than " << actual_size << " bytes" << std::endl;
+                std::cerr << "cleaning up..." << std::endl;
+                return 1;
+            }
+        }
+    }
+
+    // Pass mount point parameter to FUSE
+    struct fuse_args args = FUSE_ARGS_INIT(2, argv);
+
+    fuse_opt_parse(&args, nullptr, nullptr, nullptr);
+
+    // Allow up to 128K writes
+    fuse_opt_add_arg(&args, "-obig_writes");
+
+    // Properly unmount even on crash
+    fuse_opt_add_arg(&args, "-oauto_unmount");
+
+    // Let FUSE and the kernel deal with permissions handling
+    fuse_opt_add_arg(&args, "-odefault_permissions");
+
+    return fuse_main(args.argc, args.argv, &operations, nullptr);
 }

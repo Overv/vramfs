@@ -23,7 +23,7 @@ namespace vram {
 
         void file_t::size(size_t new_size) {
             if (new_size < _size) {
-                delete_blocks(new_size);
+                free_blocks(new_size);
             }
 
             _size = new_size;
@@ -45,13 +45,12 @@ namespace vram {
                 off_t block_off = off - block_start;
                 size_t read_size = std::min(memory::block::size - block_off, size);
 
-                memory::block block;
-                bool block_exists = get_block(block_start, block);
+                auto block = get_block(block_start);
 
                 // Allow multiple threads to block for reading simultaneously
                 wait_mutex.unlock();
-                if (block_exists) {
-                    block.read(block_off, read_size, data);
+                if (block) {
+                    block->read(block_off, read_size, data);
                 } else {
                     // Non-written part of file
                     memset(data, 0, read_size);
@@ -79,17 +78,16 @@ namespace vram {
                 off_t block_off = off - block_start;
                 size_t write_size = std::min(memory::block::size - block_off, size);
 
-                memory::block block;
-                bool block_exists = get_block(block_start, block);
+                auto block = get_block(block_start);
 
-                if (!block_exists) {
-                    block_exists = create_block(block_start, block);
+                if (!block) {
+                    block = alloc_block(block_start);
 
                     // Failed to allocate buffer, likely out of VRAM
-                    if (!block_exists) break;
+                    if (!block) break;
                 }
 
-                block.write(block_off, write_size, data, async);
+                block->write(block_off, write_size, data, async);
 
                 last_written_block = block;
 
@@ -113,33 +111,30 @@ namespace vram {
         void file_t::sync() {
             // Waits for all asynchronous writes to finish, because they must
             // complete before the last write does (OpenCL guarantee)
-            last_written_block.sync();
+            last_written_block->sync();
         }
 
-        bool file_t::get_block(off_t off, memory::block& buf) const {
+        memory::block_ref file_t::get_block(off_t off) const {
             auto it = file_blocks.find(off);
 
             if (it != file_blocks.end()) {
-                buf = it->second;
-                return true;
+                return it->second;
             } else {
-                return false;
+                return nullptr;
             }
         }
 
-        bool file_t::create_block(off_t off, memory::block& buf) {
-            bool success;
-            memory::block tmp_buf(success);
+        memory::block_ref file_t::alloc_block(off_t off) {
+            auto block = memory::allocate();
 
-            if (success) {
-                file_blocks[off] = tmp_buf;
-                buf = tmp_buf;
+            if (block) {
+                file_blocks[off] = block;
             }
 
-            return success;
+            return block;
         }
 
-        void file_t::delete_blocks(off_t off) {
+        void file_t::free_blocks(off_t off) {
             // Determine first block just beyond the range
             off_t start_off = (off / memory::block::size) * memory::block::size;
             if (off % memory::block::size != 0) start_off += memory::block::size;

@@ -3,12 +3,24 @@
 
 namespace vram {
     namespace entry {
+        int entry_count = 0;
+
+        int count() {
+            return entry_count;
+        }
+
         entry_t::entry_t() {
             auto t = util::time();
 
             _atime = t;
             _mtime = t;
             _ctime = t;
+
+            entry_count++;
+        }
+
+        entry_t::~entry_t() {
+            entry_count--;
         }
 
         void entry_t::link(dir_ptr parent, const string& name) {

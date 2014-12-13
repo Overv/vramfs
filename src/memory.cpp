@@ -12,6 +12,18 @@ namespace vram {
         cl::Buffer zero_buffer;
     #endif
 
+        std::vector<cl::Buffer> pool;
+        int total_blocks = 0;
+
+        // Fill buffer with zeros
+        static int clear_buffer(const cl::Buffer& buf) {
+        #ifdef OPENCL_1_1
+            return queue.enqueueCopyBuffer(zero_buffer, buf, 0, 0, block::size, nullptr, nullptr);
+        #else
+            return queue.enqueueFillBuffer(buf, 0, 0, block::size, nullptr, nullptr);
+        #endif
+        }
+
         // Find platform with OpenCL capable GPU
         static bool init_opencl() {
             if (ready) return true;
@@ -53,48 +65,85 @@ namespace vram {
             return (ready = init_opencl());
         }
 
-        block::block() {}
+        int pool_size() {
+            return total_blocks;
+        }
 
-        block::block(bool& success) {
+        int pool_available() {
+            return pool.size();
+        }
+
+        size_t increase_pool(size_t size) {
+            int block_count = 1 + (size - 1) / block::size;
             int r;
-            buffer = cl::Buffer(context, CL_MEM_READ_WRITE, size, nullptr, &r);
 
-            if (r == CL_SUCCESS) {
-            #ifdef OPENCL_1_1
-                r = queue.enqueueCopyBuffer(zero_buffer, buffer, 0, 0, size, nullptr, nullptr);
-            #else
-                r = queue.enqueueFillBuffer(buffer, 0, 0, size, nullptr, nullptr);
-            #endif
+            for (int i = 0; i < block_count; i++) {
+                cl::Buffer buf(context, CL_MEM_READ_WRITE, block::size, nullptr, &r);
+
+                if (r == CL_SUCCESS && clear_buffer(buf) == CL_SUCCESS) {
+                    pool.push_back(buf);
+                    total_blocks++;
+                } else {
+                    return i * block::size;
+                }
             }
 
-            success = r == CL_SUCCESS;
+            return block_count * block::size;
+        }
+
+        block_ref allocate() {
+            if (pool.size() != 0) {
+                return block_ref(new block());
+            } else {
+                return nullptr;
+            }
+        }
+
+        block::block() {
+            buffer = pool.back();
+            pool.pop_back();
+        }
+
+        block::~block() {
+            pool.push_back(buffer);
         }
 
         void block::read(off_t offset, size_t size, void* data) const {
-            // Queue is configured for in-order execution, so writes before this
-            // are guaranteed to be completed first
-            queue.enqueueReadBuffer(buffer, true, offset, size, data, nullptr, nullptr);
+            if (dirty) {
+                memset(data, 0, size);
+            } else {
+                // Queue is configured for in-order execution, so writes before this
+                // are guaranteed to be completed first
+                queue.enqueueReadBuffer(buffer, true, offset, size, data, nullptr, nullptr);
+            }
         }
 
         void block::write(off_t offset, size_t size, const void* data, bool async) {
+            // If this block has not been written to yet, and this call doesn't
+            // overwrite the entire block, clear with zeros first
+            if (dirty && size != block::size) {
+                clear_buffer(buffer);
+            }
+
             if (async) {
                 char* data_copy = new char[size];
                 memcpy(data_copy, data, size);
                 data = data_copy;
             }
 
-            auto event = std::make_shared<cl::Event>();
-            queue.enqueueWriteBuffer(buffer, !async, offset, size, data, nullptr, event.get());
+            cl::Event event;
+            queue.enqueueWriteBuffer(buffer, !async, offset, size, data, nullptr, &event);
 
             if (async) {
-                event->setCallback(CL_COMPLETE, async_write_dealloc, const_cast<void*>(data));
+                event.setCallback(CL_COMPLETE, async_write_dealloc, const_cast<void*>(data));
             }
 
             last_write = event;
+            dirty = false;
         }
 
         void block::sync() {
-            last_write->wait();
+            last_write.wait();
         }
     }
 }

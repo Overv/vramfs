@@ -7,11 +7,18 @@
 #include <iostream>
 #include <cstring>
 #include <cstdint>
+#include <limits>
 
 // Internal dependencies
 #include "vramfs.hpp"
 
 using namespace vram;
+
+/*
+ * Configuration
+ */
+
+const size_t disk_size = 2L * 1024L * 1024L * 1024L;
 
 /*
  * Globals
@@ -38,9 +45,27 @@ static void* vram_init(fuse_conn_info* conn) {
     // Check for OpenCL supported GPU
     if (!memory::is_available()) {
         return util::fatal_error("no opencl capable gpu found", nullptr);
+    } else {
+        memory::increase_pool(disk_size);
     }
 
     return nullptr;
+}
+
+/*
+ * File system info
+ */
+
+static int vram_statfs(const char*, struct statvfs* vfs) {
+    vfs->f_bsize = memory::block::size;
+    vfs->f_blocks = memory::pool_size();
+    vfs->f_bfree = memory::pool_available();
+    vfs->f_bavail = memory::pool_available();
+    vfs->f_files = entry::count();
+    vfs->f_ffree = std::numeric_limits<fsfilcnt_t>::max();
+    vfs->f_namemax = std::numeric_limits<unsigned long>::max();
+
+    return 0;
 }
 
 /*
@@ -427,6 +452,7 @@ static int vram_truncate(const char* path, off_t size) {
 static struct vram_operations : fuse_operations {
     vram_operations() {
         init = vram_init;
+        statfs = vram_statfs;
         getattr = vram_getattr;
         readlink = vram_readlink;
         utimens = vram_utimens;

@@ -47,6 +47,9 @@ namespace vram {
             const int all = file | dir | symlink;
         }
 
+        // Total entry count
+        int count();
+
         // Full description of entry
         class entry_t : public std::enable_shared_from_this<entry_t> {
         public:
@@ -56,7 +59,7 @@ namespace vram {
 
             const string& name() const;
 
-            virtual ~entry_t() {};
+            virtual ~entry_t();
 
             virtual type::type_t type() const = 0;
 
@@ -133,24 +136,24 @@ namespace vram {
 
         private:
             // Data blocks if this entry is a file
-            std::map<off_t, memory::block> file_blocks;
+            std::map<off_t, memory::block_ref> file_blocks;
 
             // Last block touched by write()
-            memory::block last_written_block;
+            memory::block_ref last_written_block;
 
             // File size
             size_t _size = 0;
 
             file_t();
 
-            // Get the OpenCL buffer of the block if it exists (returning true)
-            bool get_block(off_t off, memory::block& buf) const;
+            // Get the OpenCL buffer of the block if it exists or a nullptr
+            memory::block_ref get_block(off_t off) const;
 
             // Allocate new block, buf is only set on success (returning true)
-            bool create_block(off_t off, memory::block& buf);
+            memory::block_ref alloc_block(off_t off);
 
             // Delete all blocks with a starting offset >= *off*
-            void delete_blocks(off_t off = 0);
+            void free_blocks(off_t off = 0);
         };
 
         // Directory entry

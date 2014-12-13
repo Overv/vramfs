@@ -45,8 +45,8 @@ namespace vram {
             friend block_ref allocate();
 
         public:
-            // Nicely fits FUSE read/write size
-            static const size_t size = 128 * 1024;
+            // Best performance/size balance
+            static const size_t size = 64 * 1024;
 
             block(const block& other) = delete;
 

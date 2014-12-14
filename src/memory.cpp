@@ -4,24 +4,24 @@ namespace vram {
     namespace memory {
         // Connection with OpenCL
         bool ready = false;
+        bool has_fillbuffer = false; // supports the FillBuffer API (platform is version 1.2 or higher)
         cl::Context context;
         cl::Device device;
         cl::CommandQueue queue;
 
-    #ifdef OPENCL_1_1
-        cl::Buffer zero_buffer;
-    #endif
+        cl::Buffer zero_buffer; // used to clear buffers on pre-1.2 platforms
 
         std::vector<cl::Buffer> pool;
         int total_blocks = 0;
 
         // Fill buffer with zeros
         static int clear_buffer(const cl::Buffer& buf) {
-        #ifdef OPENCL_1_1
-            return queue.enqueueCopyBuffer(zero_buffer, buf, 0, 0, block::size, nullptr, nullptr);
-        #else
-            return queue.enqueueFillBuffer(buf, 0, 0, block::size, nullptr, nullptr);
-        #endif
+#ifdef CL_VERSION_1_2
+            if (has_fillbuffer)
+                return queue.enqueueFillBuffer(buf, 0, 0, block::size, nullptr, nullptr);
+            else
+#endif
+                return queue.enqueueCopyBuffer(zero_buffer, buf, 0, 0, block::size, nullptr, nullptr);
         }
 
         // Find platform with OpenCL capable GPU
@@ -41,14 +41,19 @@ namespace vram {
                 context = cl::Context(gpu_devices);
                 queue = cl::CommandQueue(context, device);
 
-            #ifdef OPENCL_1_1
-                char zero_data[block::size] = {};
-                int r;
-                zero_buffer = cl::Buffer(context, CL_MEM_READ_ONLY, block::size, nullptr, &r);
-                if (r != CL_SUCCESS) return false;
-                r = queue.enqueueWriteBuffer(zero_buffer, true, 0, block::size, zero_data, nullptr, nullptr);
-                if (r != CL_SUCCESS) return false;
-            #endif
+#ifdef CL_VERSION_1_2
+                cl_uint version = cl::detail::getPlatformVersion(platform());
+
+                if (version >= (1 << 16 | 2))
+                    has_fillbuffer = true;
+#endif
+
+                if (!has_fillbuffer) {
+                    char zero_data[block::size] = {};
+                    int r;
+                    zero_buffer = cl::Buffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, block::size, zero_data, &r);
+                    if (r != CL_SUCCESS) return false;
+                }
 
                 return true;
             }

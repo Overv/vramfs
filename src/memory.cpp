@@ -47,9 +47,7 @@ namespace vram {
                 if (!has_fillbuffer) {
                     char zero_data[block::size] = {};
                     int r;
-                    zero_buffer = cl::Buffer(context, CL_MEM_READ_ONLY, block::size, nullptr, &r);
-                    if (r != CL_SUCCESS) return false;
-                    r = queue.enqueueWriteBuffer(zero_buffer, true, 0, block::size, zero_data, nullptr, nullptr);
+                    zero_buffer = cl::Buffer(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, block::size, zero_data, &r);
                     if (r != CL_SUCCESS) return false;
                 }
 

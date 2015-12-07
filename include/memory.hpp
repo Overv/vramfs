@@ -27,6 +27,12 @@ namespace vram {
         // Check if current machine supports VRAM allocation
         bool is_available();
 
+        // Set the device to use
+        void set_device(size_t num);
+
+        // Returns a list of device names
+        std::vector<std::string> list_devices();
+
         // Total blocks and blocks currently free
         int pool_size();
         int pool_available();

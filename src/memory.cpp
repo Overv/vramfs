@@ -14,6 +14,8 @@ namespace vram {
         std::vector<cl::Buffer> pool;
         int total_blocks = 0;
 
+        size_t device_num;
+
         // Fill buffer with zeros
         static int clear_buffer(const cl::Buffer& buf) {
 #ifdef CL_VERSION_1_2
@@ -37,7 +39,7 @@ namespace vram {
                 platform.getDevices(CL_DEVICE_TYPE_GPU, &gpu_devices);
                 if (gpu_devices.size() == 0) continue;
 
-                device = gpu_devices[0];
+                device = gpu_devices[device_num];
                 context = cl::Context(gpu_devices);
                 queue = cl::CommandQueue(context, device);
 
@@ -68,6 +70,31 @@ namespace vram {
 
         bool is_available() {
             return (ready = init_opencl());
+        }
+
+        void set_device(size_t device) {
+            device_num = device;
+        }
+
+        std::vector<std::string> list_devices() {
+            std::vector<std::string> device_names;
+
+            std::vector<cl::Platform> platforms;
+            cl::Platform::get(&platforms);
+
+            for (auto& platform : platforms) {
+                std::vector<cl::Device> gpu_devices;
+                platform.getDevices(CL_DEVICE_TYPE_GPU, &gpu_devices);
+                if (gpu_devices.size() == 0) continue;
+
+                for (auto& device : gpu_devices) {
+                    device_names.push_back(device.getInfo<CL_DEVICE_NAME>());
+                }
+
+                break;
+            }
+
+            return device_names;
         }
 
         int pool_size() {

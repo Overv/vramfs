@@ -465,14 +465,29 @@ static struct vram_operations : fuse_operations {
 
 static int print_help() {
     std::cerr <<
-        "usage: vramfs <mountdir> <size> [-f]\n\n"
-        "  mountdir - directory to mount file system, must be empty\n"
-        "  size     - size of the disk in bytes\n"
-        "  -f       - flag that forces mounting, with a smaller size if needed\n\n"
+        "usage: vramfs <mountdir> <size> [-d <device>] [-f]\n\n"
+        "  mountdir    - directory to mount file system, must be empty\n"
+        "  size        - size of the disk in bytes\n"
+        "  -d <device> - specifies identifier of device to use\n"
+        "  -f          - flag that forces mounting, with a smaller size if needed\n\n"
         "The size may be followed by one of the following multiplicative suffixes: "
         "K=1024, KB=1000, M=1024*1024, MB=1000*1000, G=1024*1024*1024, GB=1000*1000*1000. "
-        "It's rounded up to the nearest multiple of the block size."
+        "It's rounded up to the nearest multiple of the block size.\n"
     << std::endl;
+
+    auto devices = memory::list_devices();
+
+    if (!devices.empty()) {
+        std::cerr << "device list: \n";
+
+        for (size_t i = 0; i < devices.size(); ++i) {
+            std::cerr << "  " << i << ": " << devices[i] << "\n";
+        }
+        std::cerr << std::endl;
+    } else {
+        std::cerr << "No suitable devices found." << std::endl;
+    }
+
 
     return 1;
 }
@@ -497,12 +512,22 @@ static size_t parse_size(const string& param) {
 
 int main(int argc, char* argv[]) {
     // Check parameter and parse parameters
-    if (argc != 3 && argc != 4) return print_help();
+    if (argc < 3 || argc > 6) return print_help();
     if (!std::regex_match(argv[2], size_regex)) return print_help();
     if (argc == 4 && strcmp(argv[3], "-f") != 0) return print_help();
+    if (argc == 5 && strcmp(argv[3], "-d") != 0) return print_help();
+    if (argc == 6) {
+        if (strcmp(argv[3], "-d") != 0 && strcmp(argv[5], "-f") != 0) {
+            return print_help();
+        }
+    }
 
     size_t disk_size = parse_size(argv[2]);
-    bool force_allocate = argc == 4;
+    bool force_allocate = (argc == 4 || argc == 6);
+
+    if (argc == 5 || argc == 6) {
+        memory::set_device(atoi(argv[4]));
+    }
 
     // Check for OpenCL supported GPU and allocate memory
     if (!memory::is_available()) {

@@ -20,18 +20,17 @@ PCI-e bandwidth limits. See the *benchmarks* section for more info.
 
 - Linux with kernel 2.6+
 - FUSE development files
-- A graphics card with support for OpenCL 1.1
+- A graphics card with support for OpenCL 1.2
 
 #### Building
 
 First, install the OpenCL driver for your graphics card and verify that it's
 recognized as an OpenCL device by running `clinfo`. Then install the `libfuse-dev`
-package or build it from source.
+package or build it from source. You will also need OpenCL development files,
+(`opencl-dev` package or equivalent), with version 1.2 of the OpenCL headers
+at least.
 
-Compiling depends on your platform:
-
-* **AMD:** `make`
-* **NVIDIA:** `make OPENCL_1_1=1`
+Just run `make` to build `vramfs`.
 
 If you want to debug with valgrind, you should compile with the minimal fake
 OpenCL implementation to avoid filling your screen with warnings caused by the

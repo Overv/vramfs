@@ -18,11 +18,9 @@ namespace vram {
 
         // Fill buffer with zeros
         static int clear_buffer(const cl::Buffer& buf) {
-#ifdef CL_VERSION_1_2
             if (has_fillbuffer)
                 return queue.enqueueFillBuffer(buf, 0, 0, block::size, nullptr, nullptr);
             else
-#endif
                 return queue.enqueueCopyBuffer(zero_buffer, buf, 0, 0, block::size, nullptr, nullptr);
         }
 
@@ -43,12 +41,10 @@ namespace vram {
                 context = cl::Context(gpu_devices);
                 queue = cl::CommandQueue(context, device);
 
-#ifdef CL_VERSION_1_2
                 cl_uint version = cl::detail::getPlatformVersion(platform());
 
                 if (version >= (1 << 16 | 2))
                     has_fillbuffer = true;
-#endif
 
                 if (!has_fillbuffer) {
                     char zero_data[block::size] = {};

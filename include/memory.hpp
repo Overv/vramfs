@@ -9,10 +9,6 @@
 #ifdef DEBUG
     // Use minimal OpenCL implementation for better debugging with valgrind
     #include "CL/debugcl.hpp"
-#elif OPENCL_1_1
-    // OpenCL 1.1 header uses deprecated APIs
-    #define CL_USE_DEPRECATED_OPENCL_1_1_APIS
-    #include <CL/cl_1_1.hpp>
 #else
     #include <CL/cl.hpp>
 #endif

@@ -8,10 +8,6 @@ else
 	CFLAGS += -march=native -O2 -flto
 endif
 
-ifeq ($(OPENCL_1_1), 1)
-	CFLAGS += -DOPENCL_1_1
-endif
-
 bin/vramfs: build/util.o build/memory.o build/entry.o build/file.o build/dir.o build/symlink.o build/vramfs.o | bin
 	$(CC) -o $@ $^ $(LDFLAGS)
 

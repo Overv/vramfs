@@ -1,6 +1,7 @@
 #ifndef VRAM_MEMORY_HPP
 #define VRAM_MEMORY_HPP
-
+#define CL_HPP_TARGET_OPENCL_VERSION 120
+#define CL_HPP_MINIMUM_OPENCL_VERSION 110
 /*
  * VRAM block allocation
  */
@@ -10,7 +11,7 @@
     // Use minimal OpenCL implementation for better debugging with valgrind
     #include "CL/debugcl.hpp"
 #else
-    #include <CL/cl.hpp>
+    #include <CL/cl2.hpp>
 #endif
 
 #include <memory>

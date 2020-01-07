@@ -11,19 +11,28 @@
 
 #define CL_CALLBACK
 
-const int CL_MEM_READ_WRITE = 0;
+const int CL_MEM_READ_WRITE = (1 << 0);
+const int CL_MEM_READ_ONLY = (1 << 2);
+const int CL_MEM_COPY_HOST_PTR = (1 << 5);
 const int CL_SUCCESS = 0;
 const int CL_DEVICE_TYPE_GPU = 0;
 const int CL_COMPLETE = 0;
 
+const int CL_DEVICE_NAME = 0x102B;
+
 typedef int cl_event;
 typedef int cl_int;
+typedef unsigned int cl_uint;
 
 typedef CL_CALLBACK void (*callback_fn)(cl_event, cl_int, void*);
 
 namespace cl {
     class Device {
-
+    public:
+        template <int T>
+        const char* getInfo() {
+            return "DEBUG DEVICE";
+        }
     };
 
     class Platform {
@@ -34,6 +43,10 @@ namespace cl {
 
         static void get(std::vector<Platform>* platforms) {
             platforms->push_back(Platform());
+        }
+
+        void* operator()() {
+            return nullptr;
         }
     };
 
@@ -53,6 +66,10 @@ namespace cl {
             data = std::make_shared<std::vector<char>>();
             data->resize(size);
             if (err) *err = CL_SUCCESS;
+
+            if (flags & CL_MEM_COPY_HOST_PTR) {
+                memcpy(data->data(), host_ptr, size);
+            }
         }
 
         std::shared_ptr<std::vector<char>> data;
@@ -96,6 +113,12 @@ namespace cl {
             return CL_SUCCESS;
         }
     };
+
+    namespace detail {
+        inline cl_uint getPlatformVersion(void* platform) {
+            return 0;
+        }
+    }
 }
 
 #endif

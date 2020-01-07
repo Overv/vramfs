@@ -17,7 +17,7 @@ namespace vram {
         size_t device_num;
 
         // Fill buffer with zeros
-        static int clear_buffer(const cl::Buffer& buf) {
+        static int clear_buffer(cl::Buffer& buf) {
             if (has_fillbuffer)
                 return queue.enqueueFillBuffer(buf, 0, 0, block::size, nullptr, nullptr);
             else

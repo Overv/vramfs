@@ -32,12 +32,17 @@ namespace vram {
             cl::Platform::get(&platforms);
             if (platforms.size() == 0) return false;
 
+            auto index = device_num;
             for (auto& platform : platforms) {
                 std::vector<cl::Device> gpu_devices;
                 platform.getDevices(CL_DEVICE_TYPE_GPU, &gpu_devices);
-                if (gpu_devices.size() == 0) continue;
+                if (index >= gpu_devices.size())
+                {
+                    index -= gpu_devices.size();
+                    continue;
+                }
 
-                device = gpu_devices[device_num];
+                device = gpu_devices[index];
                 context = cl::Context(gpu_devices);
                 queue = cl::CommandQueue(context, device);
 
@@ -81,13 +86,10 @@ namespace vram {
             for (auto& platform : platforms) {
                 std::vector<cl::Device> gpu_devices;
                 platform.getDevices(CL_DEVICE_TYPE_GPU, &gpu_devices);
-                if (gpu_devices.size() == 0) continue;
 
                 for (auto& device : gpu_devices) {
                     device_names.push_back(device.getInfo<CL_DEVICE_NAME>());
                 }
-
-                break;
             }
 
             return device_names;

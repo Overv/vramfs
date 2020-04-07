@@ -80,7 +80,7 @@ static int vram_getattr(const char* path, struct stat* stbuf, fuse_file_info*) {
         stbuf->st_blksize = memory::block::size;
 
         if (entry->size() > 0) {
-            stbuf->st_blocks = 1 + (entry->size() - 1) / memory::block::size;
+            stbuf->st_blocks = 1 + (entry->size() - 1) / 512; // man 2 stat
         }
     } else {
         stbuf->st_mode = S_IFLNK | 0777;

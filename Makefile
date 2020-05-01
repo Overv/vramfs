@@ -1,6 +1,6 @@
 CC = g++
-CFLAGS = -Wall -Wpedantic -Werror -std=c++11 $(shell pkg-config fuse --cflags) -I include/
-LDFLAGS = -flto $(shell pkg-config fuse --libs) -l OpenCL
+CFLAGS = -Wall -Wpedantic -Werror -std=c++11 $(shell pkg-config fuse3 --cflags) -I include/
+LDFLAGS = -flto $(shell pkg-config fuse3 --libs) -l OpenCL
 
 ifeq ($(DEBUG), 1)
 	CFLAGS += -g -DDEBUG -Wall -Werror -std=c++11

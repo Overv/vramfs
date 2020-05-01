@@ -1,5 +1,5 @@
 // Third-party libraries
-#define FUSE_USE_VERSION 26
+#define FUSE_USE_VERSION 30
 #include <fuse.h>
 #include <unistd.h>
 
@@ -31,7 +31,7 @@ static entry::dir_ref root_entry;
  * Initialisation
  */
 
-static void* vram_init(fuse_conn_info* conn) {
+static void* vram_init(fuse_conn_info* conn, fuse_config*) {
     root_entry = entry::dir_t::make(nullptr, "");
     root_entry->user(geteuid());
     root_entry->group(getegid());
@@ -61,7 +61,7 @@ static int vram_statfs(const char*, struct statvfs* vfs) {
  * Entry attributes
  */
 
-static int vram_getattr(const char* path, struct stat* stbuf) {
+static int vram_getattr(const char* path, struct stat* stbuf, fuse_file_info*) {
     lock_guard<mutex> local_lock(fsmutex);
 
     // Look up entry
@@ -118,7 +118,7 @@ static int vram_readlink(const char* path, char* buf, size_t size) {
  * Set the mode bits of an entry
  */
 
-static int vram_chmod(const char* path, mode_t mode) {
+static int vram_chmod(const char* path, mode_t mode, fuse_file_info*) {
     lock_guard<mutex> local_lock(fsmutex);
 
     entry::entry_ref entry;
@@ -134,7 +134,7 @@ static int vram_chmod(const char* path, mode_t mode) {
  * Change the owner/group of an entry
  */
 
-static int vram_chown(const char* path, uid_t user, gid_t group) {
+static int vram_chown(const char* path, uid_t user, gid_t group, fuse_file_info*) {
     lock_guard<mutex> lock_lock(fsmutex);
 
     entry::entry_ref entry;
@@ -151,7 +151,7 @@ static int vram_chown(const char* path, uid_t user, gid_t group) {
  * Set the last access and last modified times of an entry
  */
 
-static int vram_utimens(const char* path, const timespec tv[2]) {
+static int vram_utimens(const char* path, const timespec tv[2], fuse_file_info*) {
     lock_guard<mutex> local_lock(fsmutex);
 
     entry::entry_ref entry;
@@ -168,7 +168,7 @@ static int vram_utimens(const char* path, const timespec tv[2]) {
  * Directory listing
  */
 
-static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, fuse_file_info*) {
+static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, fuse_file_info*, fuse_readdir_flags) {
     lock_guard<mutex> local_lock(fsmutex);
 
     // Look up directory
@@ -178,11 +178,11 @@ static int vram_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off
     auto dir = dynamic_pointer_cast<entry::dir_t>(entry);
 
     // Required default entries
-    filler(buf, ".", nullptr, 0);
-    filler(buf, "..", nullptr, 0);
+    filler(buf, ".", nullptr, 0, FUSE_FILL_DIR_PLUS);
+    filler(buf, "..", nullptr, 0, FUSE_FILL_DIR_PLUS);
 
     for (auto& pair : dir->children()) {
-        filler(buf, pair.second->name().c_str(), nullptr, 0);
+        filler(buf, pair.second->name().c_str(), nullptr, 0, FUSE_FILL_DIR_PLUS);
     }
 
     return 0;
@@ -326,7 +326,7 @@ static int vram_rmdir(const char* path) {
  * Rename entry
  */
 
-static int vram_rename(const char* path, const char* new_path) {
+static int vram_rename(const char* path, const char* new_path, unsigned int) {
     lock_guard<mutex> local_lock(fsmutex);
 
     // Look up entry
@@ -421,7 +421,7 @@ static int vram_release(const char* path, fuse_file_info* fi) {
  * Change file size
  */
 
-static int vram_truncate(const char* path, off_t size) {
+static int vram_truncate(const char* path, off_t size, fuse_file_info*) {
     lock_guard<mutex> local_lock(fsmutex);
 
     entry::entry_ref entry;
@@ -553,9 +553,6 @@ int main(int argc, char* argv[]) {
     struct fuse_args args = FUSE_ARGS_INIT(2, argv);
 
     fuse_opt_parse(&args, nullptr, nullptr, nullptr);
-
-    // Allow up to 128K writes
-    fuse_opt_add_arg(&args, "-obig_writes");
 
     // Properly unmount even on crash
     fuse_opt_add_arg(&args, "-oauto_unmount");

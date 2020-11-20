@@ -27,8 +27,8 @@ PCI-e bandwidth limits. See the *benchmarks* section for more info.
 First, install the OpenCL driver for your graphics card and verify that it's
 recognized as an OpenCL device by running `clinfo`. Then install the `libfuse3-dev`
 package or build it from source. You will also need `pkg-config` and OpenCL 
-development files, (`opencl-dev` package or equivalent), with version 1.2 of 
-the OpenCL headers at least.
+development files, (`opencl-dev`, `opencl-clhpp-headers` package or equivalent), 
+with version 1.2 of the OpenCL headers at least.
 
 Just run `make` to build `vramfs`.
 

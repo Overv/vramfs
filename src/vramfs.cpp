@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <limits>
 #include <regex>
+#include <sys/mman.h>
 
 // Internal dependencies
 #include "vramfs.hpp"
@@ -527,6 +528,11 @@ int main(int argc, char* argv[]) {
 
     if (argc == 5 || argc == 6) {
         memory::set_device(atoi(argv[4]));
+    }
+
+    // Lock process pages in memory to prevent them from being swapped
+    if (mlockall(MCL_CURRENT | MCL_FUTURE)) {
+        std::cerr << "failed to lock process pages in memory, vramfs may freeze if swapped" << std::endl;
     }
 
     // Check for OpenCL supported GPU and allocate memory

@@ -569,5 +569,11 @@ int main(int argc, char* argv[]) {
     // OpenCL driver acts funky if program doesn't keep running in foreground
     fuse_opt_add_arg(&args, "-f");
 
+    pid_t pid;
+    pid = fork();
+    if(pid > 0) {
+      exit(EXIT_SUCCESS);
+    }
+    // Child   
     return fuse_main(args.argc, args.argv, &operations, nullptr);
 }

@@ -11,7 +11,7 @@
     // Use minimal OpenCL implementation for better debugging with valgrind
     #include "CL/debugcl.hpp"
 #else
-    #include <CL/cl2.hpp>
+    #include <CL/opencl.hpp>
 #endif
 
 #include <memory>

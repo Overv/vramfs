@@ -20,3 +20,14 @@ build/%.o: src/%.cpp | build
 .PHONY: clean
 clean:
 	rm -rf build/ bin/
+
+.PHONY: install
+install: bin/vramfs
+	install -d $(DEST)/usr/local/bin/
+	install bin/vramfs $(DEST)/usr/local/bin/
+	install fuse3.vramfs $(DEST)/usr/local/bin/
+
+.PHONY: uninstall
+uninstall:
+	$(RM) $(DEST)/usr/local/bin/fuse3.vramfs
+	$(RM) $(DEST)/usr/local/bin/vramfs

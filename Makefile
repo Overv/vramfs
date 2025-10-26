@@ -1,11 +1,9 @@
-CC = g++
-CFLAGS = -Wall -Wpedantic -Werror -std=c++20 $(shell pkg-config fuse3 --cflags) -I include/
-LDFLAGS = -flto $(shell pkg-config fuse3 --libs) -l OpenCL
+CC ?= g++
+CFLAGS += -std=c++20 $(shell pkg-config fuse3 --cflags) -I include/
+LDFLAGS += $(shell pkg-config fuse3 --libs) -l OpenCL
 
 ifeq ($(DEBUG), 1)
-	CFLAGS += -g -DDEBUG -Wall -Werror -std=c++11
-else
-	CFLAGS += -march=native -O2 -flto
+	CFLAGS += -g -DDEBUG -Wall -Werror
 endif
 
 bin/vramfs: build/util.o build/memory.o build/entry.o build/file.o build/dir.o build/symlink.o build/vramfs.o | bin

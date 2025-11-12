@@ -38,6 +38,12 @@ OpenCL driver:
 
 * **valgrind:** `make DEBUG=1`
 
+#### Installing
+
+For a recommended way to install see the Makefile’s `install` target. You can
+invoke the install target directly be running `sudo make install` after
+finishing the build.
+
 #### Mounting
 
 Mount a disk by running `bin/vramfs <mountdir> <size>`. The `mountdir` can be

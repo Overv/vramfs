@@ -1,0 +1,114 @@
+#!/bin/sh
+# POSIX compatible shell script implementing the mount helper calling convention
+#
+# Place this in the system $PATH (/usr/local/bin) next to the built `vramfs`
+# binary to allow usage of vramfs as:
+#
+#   mount -t fuse3.vramfs <device> <mountdir> -o size=<size>
+#
+# (Including the respective fstab and systemd equivalents.)
+set -eu
+
+NAME="${0##*/}"
+VRAMFS=vramfs
+
+print_help() {
+	if [ $# -gt 0 ];
+	then
+		echo "${NAME}: ${1}"
+		echo
+	fi
+	
+	echo "usage: ${NAME} <device> <mountdir> -o size=<size>[,…]"
+	echo
+	echo "  device      - device number of target device, starting from 0"
+	echo "  mountdir    - directory to mount file system, must be empty"
+	echo "  size        - size of the disk in bytes"
+	echo
+	"${VRAMFS}" 2>&1 | tail -n +8
+}
+
+# Argument list validation
+if [ $# -eq 0 ];
+then
+	print_help
+	exit 0
+fi
+
+if [ $# -ne 4 ];
+then
+	print_help "Exactly 4 arguments expected" >&2
+	exit 1
+fi
+
+if [ "$3" != "-o" ];
+then
+	print_help "Argument 3 must be \`-o\`, following the mount helper program convention" >&2
+	exit 1
+fi
+
+# Save position arguments
+DEVICE="$1"
+MOUNTDIR="$2"
+
+# Use options list (splitted at `,`) as argument list
+#
+# Source: https://unix.stackexchange.com/a/312284/47938
+OLDIFS="${IFS}"
+set -f; IFS=","
+set -- $4
+set +f; IFS="${OLDIFS}"
+
+# Process mount options
+SIZE=
+for opt in "$@";
+do
+	case "${opt}" in
+		# Ignore generic mount options that apply by default
+		rw|suid|dev|exec|noatime|async) ;;
+
+		# Print warning for unsupported generic mount options
+		ro|nosuid|nodev|noexec|atime|sync|dirsync)
+			echo "${NAME}: Ignoring unsupported generic mount option: ${opt}" >&2
+		;;
+
+		# Store value of required size option
+		size=*)
+			SIZE=${opt#*=}
+		;;
+
+		# All other mount options are errors
+		*)
+			print_help "Recevied unsupported mount option: ${opt}" >&2
+			exit 1
+		;;
+	esac
+done
+
+if [ -z "${SIZE}" ];
+then
+	print_help "Missing required mount option: size=…" >&2
+	exit 1
+fi
+
+# Defer to actual fuse binary, exiting after it started
+PARENT=$$
+trap "exit 0" HUP   # Return success if launch succeeded
+{
+	"${VRAMFS}" "${MOUNTDIR}" "${SIZE}" -d "${DEVICE}" 2>&1 | while read -r line;
+	do
+		echo "${line}" >&2
+		
+		if [ "${line}" = "mounted." ];
+		then
+			kill -s HUP ${PARENT}
+
+			# Replace sub-shell with `cat` to keep process standard output
+			# functioning without requiring the shell to remain
+			exec cat
+		fi
+	done
+} &
+wait $!
+
+exit 4  # Return error if launch failed / no signal was trapped
